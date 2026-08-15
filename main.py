@@ -84,6 +84,8 @@ SELL_PRICES = {
     GRANT_CARD_DATA,
     GIVE_MONEY_DATA,
     WAITING_VIEW_USER_INV,
+    # Стартовый набор (админка)
+    FREEPACK_ADMIN_SELECT_CARDS,
     # Промокоды
     ADD_PROMO_CODE,
     ADD_PROMO_TYPE,
@@ -99,10 +101,7 @@ SELL_PRICES = {
     # Админ выставление паков на время
     ADMIN_SHOP_PACK_SELECT,
     ADMIN_SHOP_PACK_HOURS,
-    # Стартовый набор (админка)
-    STARTER_PACK_CONFIG_MENU,
-    STARTER_PACK_SELECT_CARD,
-) = range(45)
+) = range(44)
 
 # ---------- БД (PostgreSQL) ----------
 def get_db():
@@ -125,14 +124,7 @@ def init_db():
             daily_streak INTEGER DEFAULT 0,
             last_wheel_spin TIMESTAMP,
             free_card_cooldown_reset_until TIMESTAMP,
-            has_claimed_freepack BOOLEAN DEFAULT FALSE
-        )
-    ''')
-    
-    # Таблица для административной настройки стартовых карточек
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS starter_pack_cards (
-            card_id INTEGER PRIMARY KEY REFERENCES cards(id) ON DELETE CASCADE
+            freepack_claimed BOOLEAN DEFAULT FALSE
         )
     ''')
     
@@ -255,6 +247,13 @@ def init_db():
             pack_id INTEGER REFERENCES packs(id) ON DELETE CASCADE,
             buy_count INTEGER DEFAULT 0,
             PRIMARY KEY(user_id, pack_id)
+        )
+    ''')
+
+    # Конфигурация стартового набора (admin configured freepack)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS freepack_config (
+            card_id INTEGER PRIMARY KEY REFERENCES cards(id) ON DELETE CASCADE
         )
     ''')
 
@@ -510,8 +509,8 @@ def card_admin_keyboard():
         ["📁 Создать коллекцию", "🛡 Создать команду"],
         ["❌ Удалить команду", "🃏 Добавить карточку"],
         ["❌ Удалить карточку", "📦 Добавить пак"],
-        ["🎁 Выдать карточку игроку", "💰 Выдать деньги"],
-        ["🎟 Создать промокод", "🎁 Настройка стартового набора"],
+        ["📦 Настроить стартовый набор", "🎁 Выдать карточку игроку"],
+        ["💰 Выдать деньги", "🎟 Создать промокод"],
         ["⬅️ Выйти из настройки карточек"]
     ], resize_keyboard=True)
 
@@ -539,6 +538,81 @@ COUNTRIES = [
     "UK", "France", "Austria", "Norway", "Denmark", "Japan", "China"
 ]
 
+# ---------- ЛОГИКА СТАРТОВОГО НАБОРА (/freepack) ----------
+async def grant_free_pack_to_user(user_id, context):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT freepack_claimed FROM users WHERE user_id = %s", (user_id,))
+    usr = c.fetchone()
+    if usr and usr['freepack_claimed']:
+        conn.close()
+        return False, "❌ Вы уже получили свой бесплатный стартовый набор!"
+
+    c.execute("SELECT card_id FROM freepack_config")
+    conf_cards = c.fetchall()
+
+    if not conf_cards:
+        # Если админ не настроил стартовый набор, выдаем автоматический набор (1 Вратарь + 4 Полевых)
+        c.execute("SELECT id FROM cards WHERE position = 'Goalie' LIMIT 1")
+        g_card = c.fetchone()
+        c.execute("SELECT id FROM cards WHERE position = 'Skater' LIMIT 4")
+        s_cards = c.fetchall()
+        
+        if not g_card or len(s_cards) < 4:
+            conn.close()
+            return False, "❌ В базе данных недостаточно карт для формирования стартового набора. Обратитесь к администратору."
+        card_ids = [g_card['id']] + [s['id'] for s in s_cards]
+    else:
+        card_ids = [rc['card_id'] for rc in conf_cards]
+
+    for cid in card_ids:
+        c.execute("INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1) ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1", (user_id, cid))
+
+    # Автоматически заполняем состав игрока карточками из набора
+    c.execute("SELECT * FROM cards WHERE id IN %s", (tuple(card_ids),))
+    all_issued_cards = c.fetchall()
+    
+    goalie_id = next((c_item['id'] for c_item in all_issued_cards if c_item['position'] == 'Goalie'), None)
+    skaters = [c_item['id'] for c_item in all_issued_cards if c_item['position'] == 'Skater']
+
+    c.execute('''
+        INSERT INTO user_rosters (user_id, goalie_id, skater1_id, skater2_id, skater3_id, skater4_id)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+            goalie_id = COALESCE(user_rosters.goalie_id, EXCLUDED.goalie_id),
+            skater1_id = COALESCE(user_rosters.skater1_id, EXCLUDED.skater1_id),
+            skater2_id = COALESCE(user_rosters.skater2_id, EXCLUDED.skater2_id),
+            skater3_id = COALESCE(user_rosters.skater3_id, EXCLUDED.skater3_id),
+            skater4_id = COALESCE(user_rosters.skater4_id, EXCLUDED.skater4_id)
+    ''', (
+        user_id, 
+        goalie_id, 
+        skaters[0] if len(skaters) > 0 else None,
+        skaters[1] if len(skaters) > 1 else None,
+        skaters[2] if len(skaters) > 2 else None,
+        skaters[3] if len(skaters) > 3 else None,
+    ))
+
+    c.execute("UPDATE users SET freepack_claimed = TRUE WHERE user_id = %s", (user_id,))
+    conn.commit()
+    conn.close()
+    return True, "🎉 **Поздравляем!** Вы успешно получили бесплатный стартовый набор карточек и они сразу были установлены в ваш состав!"
+
+async def freepack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+    user = update.effective_user
+    get_or_create_user(user.id, user.username, user.first_name)
+    success, msg = await grant_free_pack_to_user(user.id, context)
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def freepack_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "claim_freepack_btn":
+        success, msg = await grant_free_pack_to_user(query.from_user.id, context)
+        await query.message.edit_text(msg, parse_mode="Markdown")
+
 # ---------- КОМАНДА /getid ----------
 async def getid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -546,100 +620,6 @@ async def getid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆔 **ID этого чата:** `{chat.id}`\n📌 **Тип чата:** `{chat.type}`",
         parse_mode="Markdown"
     )
-
-# ---------- КОМАНДА /freepack ----------
-async def freepack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_pm_registered(update, context):
-        return
-
-    user = update.effective_user
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT has_claimed_freepack FROM users WHERE user_id = %s", (user.id,))
-    u_row = c.fetchone()
-    
-    if not u_row:
-        get_or_create_user(user.id, user.username, user.first_name)
-        has_claimed = False
-    else:
-        has_claimed = u_row['has_claimed_freepack']
-
-    if has_claimed:
-        conn.close()
-        await update.message.reply_text("❌ Вы уже получили свой бесплатный стартовый набор карточек!", parse_mode="Markdown")
-        return
-
-    c.execute("SELECT card_id FROM starter_pack_cards")
-    sp_rows = c.fetchall()
-    
-    if not sp_rows:
-        conn.close()
-        await update.message.reply_text("⚠️ Администратор еще не настроил стартовый набор карточек в админке. Попробуйте позже или обратитесь к администрации.", parse_mode="Markdown")
-        return
-
-    card_ids = [r['card_id'] for r in sp_rows]
-    c.execute("SELECT c.*, col.name as collection_name, t.name as team_name, t.emoji as team_emoji FROM cards c JOIN collections col ON c.collection_id = col.id LEFT JOIN card_teams t ON c.team_id = t.id WHERE c.id IN %s", (tuple(card_ids),))
-    starter_cards = c.fetchall()
-
-    if not starter_cards:
-        conn.close()
-        await update.message.reply_text("⚠️ Ошибка: настроенные карточки стартового набора не найдены в базе.", parse_mode="Markdown")
-        return
-
-    # Выдаем все карточки из стартового набора игроку
-    granted_lines = []
-    for card in starter_cards:
-        c.execute("INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1) ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1", (user.id, card['id']))
-        team_str = f"{card['team_emoji'] or '🏒'} {card['team_name']}" if card['team_name'] else "Без команды"
-        granted_lines.append(f"• **{card['nickname']}** ({card['ovr']} OVR) [{card['rarity']}] — {team_str}")
-
-    # Автоматически заполняем пустые слоты состава игрока выдаными картами
-    c.execute("SELECT * FROM user_rosters WHERE user_id = %s", (user.id,))
-    roster = c.fetchone()
-    if not roster:
-        c.execute("INSERT INTO user_rosters (user_id) VALUES (%s)", (user.id,))
-        c.execute("SELECT * FROM user_rosters WHERE user_id = %s", (user.id,))
-        roster = c.fetchone()
-
-    # Распределяем выданные карты в состав, если слоты пусты
-    goalie_c = next((sc for sc in starter_cards if sc['position'] == 'Goalie'), None)
-    skaters_c = [sc for sc in starter_cards if sc['position'] == 'Skater']
-
-    if goalie_c and not roster['goalie_id']:
-        c.execute("UPDATE user_rosters SET goalie_id = %s WHERE user_id = %s", (goalie_c['id'], user.id))
-    
-    skater_fields = ['skater1_id', 'skater2_id', 'skater3_id', 'skater4_id']
-    s_idx = 0
-    for sf in skater_fields:
-        if not roster[sf] and s_idx < len(skaters_c):
-            c.execute(f"UPDATE user_rosters SET {sf} = %s WHERE user_id = %s", (skaters_c[s_idx]['id'], user.id))
-            s_idx += 1
-
-    # Также проверим если есть еще пустые слоты, а в стартовом наборе были другие карты
-    c.execute("SELECT * FROM user_rosters WHERE user_id = %s", (user.id,))
-    roster = c.fetchone()
-    if not roster['goalie_id']:
-        any_g = next((sc for sc in starter_cards if sc['position'] == 'Goalie'), None)
-        if any_g:
-            c.execute("UPDATE user_rosters SET goalie_id = %s WHERE user_id = %s", (any_g['id'], user.id))
-    for sf in skater_fields:
-        if not roster[sf]:
-            any_s = next((sc for sc in starter_cards if sc['position'] == 'Skater'), None)
-            if any_s:
-                c.execute(f"UPDATE user_rosters SET {sf} = %s WHERE user_id = %s", (any_s['id'], user.id))
-
-    c.execute("UPDATE users SET has_claimed_freepack = TRUE WHERE user_id = %s", (user.id,))
-    conn.commit()
-    conn.close()
-
-    cards_text = "\n".join(granted_lines)
-    text = (
-        f"🎁 **Поздравляем! Вы успешно получили стартовый набор карточек!**\n\n"
-        f"{cards_text}\n\n"
-        f"✅ Ваши карточки добавлены в инвентарь и автоматически распределены в состав!\n"
-        f"Теперь вы можете искать матчи с помощью команды /cardmatch."
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
 # ---------- ЕЖЕДНЕВНЫЙ БОНУС (/daily) ----------
 async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -766,20 +746,7 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    prizes = [
-        "reset_cd",
-        "money",
-        "card_50_65",
-        "card_70_80",
-        "card_80_85",
-        "discount",
-        "custom_card",
-        "rare",
-        "very_rare",
-        "epic",
-        "mythic",
-        "nothing"
-    ]
+    prizes = ["reset_cd", "money", "card_50_65", "card_70_80", "card_80_85", "discount", "custom_card", "rare", "very_rare", "epic", "mythic", "nothing"]
     prize = random.choice(prizes)
 
     conn = get_db()
@@ -976,7 +943,7 @@ async def rps_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     await query.message.edit_text(text, parse_mode="Markdown")
 
-# ---------- ПРОФИЛЬ И СОСТАВ С ДОП ПОЛЯМИ (/profile И /checkprofile) ----------
+# ---------- ПРОФИЛЬ И СОСТАВ (/profile И /checkprofile) ----------
 async def checkprofile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -1071,7 +1038,7 @@ async def checkprofile_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
 
-# ЛОГИКА КАРТОЧЕК И ВЫДАЧИ (/rplcards / Кнопка) С КОЛЛЕКЦИЕЙ
+# ---------- ПОЛУЧЕНИЕ БЕСПЛАТНОЙ КАРТЫ (/rplcards) ----------
 async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -1383,7 +1350,7 @@ async def inventory_callback_handler(update: Update, context: ContextTypes.DEFAU
         await query.answer("🎉 Вы успешно скрафтили Легендарную карточку!", show_alert=True)
         await show_inventory(update, context, edit=True)
 
-# ---------- ТОРГОВАЯ ПЛОЩАДКА (/cardshop) - ИСПРАВЛЕНА ----------
+# ---------- ТОРГОВАЯ ПЛОЩАДКА (/cardshop) ----------
 async def cardshop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -1398,23 +1365,6 @@ async def show_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     c = conn.cursor()
-    
-    # Диагностика и исправление: автоматически удаляем "осиротевшие" лоты с рынка,
-    # если карточки больше не принадлежат никому или их количество стало нулевым/отрицательным
-    c.execute('''
-        SELECT m.id FROM market m
-        LEFT JOIN user_cards uc ON m.seller_id = uc.user_id AND m.card_id = uc.card_id
-        WHERE uc.card_id IS NULL OR uc.count <= 0
-    ''')
-    orphan_lots = c.fetchall()
-    if orphan_lots:
-        orphan_ids = tuple(lot['id'] for lot in orphan_lots)
-        if len(orphan_ids) == 1:
-            c.execute("DELETE FROM market WHERE id = %s", (orphan_ids[0],))
-        else:
-            c.execute("DELETE FROM market WHERE id IN %s", (orphan_ids,))
-        conn.commit()
-
     c.execute('''
         SELECT m.id as market_id, m.price, m.seller_id, c.id as card_id, c.nickname, c.position, c.ovr, c.rarity, u.username, u.first_name
         FROM market m
@@ -1439,7 +1389,7 @@ async def show_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
             seller_name = f"@{item['username']}" if item['username'] else item['first_name']
             text += f"🏷 **#{item['market_id']}** | **{item['nickname']}** ({item['position']}, {item['ovr']} OVR) [{item['rarity']}] — **{item['price']} RPLCoin** (Продавец: {seller_name})\n"
             if item['seller_id'] != user.id:
-                buttons.append([InlineKeyboardButton(f"Купить #{item['market_id']} ({item['nickname']}) - {item['price']} RPLCoin", callback_data=f"buy_market_{item['market_id']}")])
+                buttons.append([InlineKeyboardButton(f"Купить #{item['market_id']} ({item['nickname']}) - {item['price']} RPL", callback_data=f"buy_market_{item['market_id']}")])
 
     nav_btns = []
     if my_cnt > 0:
@@ -1571,8 +1521,7 @@ async def market_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         conn = get_db()
         c = conn.cursor()
 
-        # Используем транзакционную безопасность (строгая изоляция / проверка наличия лота и балансов)
-        c.execute("SELECT * FROM market WHERE id = %s FOR UPDATE", (market_id,))
+        c.execute("SELECT * FROM market WHERE id = %s", (market_id,))
         item = c.fetchone()
 
         if not item:
@@ -1586,27 +1535,14 @@ async def market_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("❌ Вы не можете купить собственный лот!", show_alert=True)
             return
 
-        c.execute("SELECT balance FROM users WHERE user_id = %s FOR UPDATE", (user.id,))
-        buyer_row = c.fetchone()
-        if not buyer_row:
-            conn.close()
-            await query.answer("❌ Ошибка профиля покупателя!", show_alert=True)
-            return
-        buyer_bal = buyer_row['balance']
+        c.execute("SELECT balance FROM users WHERE user_id = %s", (user.id,))
+        buyer_bal = c.fetchone()['balance']
 
         if buyer_bal < item['price']:
             conn.close()
             await query.answer("❌ Недостаточно RPLCoin для покупки!", show_alert=True)
             return
 
-        # Проверяем, существует ли продавец в базе
-        c.execute("SELECT user_id FROM users WHERE user_id = %s", (item['seller_id'],))
-        if not c.fetchone():
-            conn.close()
-            await query.answer("❌ Ошибка продавца: аккаунт не найден!", show_alert=True)
-            return
-
-        # Проведение покупки с обновлением балансов и передачей карты
         c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (item['price'], user.id))
         c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (item['price'], item['seller_id']))
 
@@ -1670,7 +1606,7 @@ async def execute_market_list_price(update: Update, context: ContextTypes.DEFAUL
         conn.commit()
         conn.close()
 
-        await update.message.reply_text(f"✅ **Карточка успешно выставляется за {price} RPLCoin на Торговую площадку!**", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ **Карточка успешно выставлена за {price} RPLCoin на Торговую площадку!**", parse_mode="Markdown")
         await show_market(update, context)
         return ConversationHandler.END
 
@@ -2173,128 +2109,6 @@ async def admin_promo_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Введите число!")
         return ADD_PROMO_LIMIT
 
-# ---------- НАСТРОЙКА СТАРТОВОГО НАБОРА В АДМИНКЕ ----------
-async def admin_starter_pack_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('''
-        SELECT sp.card_id, c.nickname, c.ovr, c.rarity, c.position 
-        FROM starter_pack_cards sp
-        JOIN cards c ON sp.card_id = c.id
-    ''')
-    sp_cards = c.fetchall()
-    conn.close()
-
-    text = "🎁 **Настройка Стартового Набора (/freepack):**\n\nТекущие карточки в стартовом паке:\n"
-    buttons = []
-
-    if not sp_cards:
-        text += "📭 В стартовом паке пока нет карточек.\n"
-    else:
-        for sc in sp_cards:
-            text += f"• ID `{sc['card_id']}` | **{sc['nickname']}** ({sc['position']}, {sc['ovr']} OVR) [{sc['rarity']}]\n"
-            buttons.append([InlineKeyboardButton(f"❌ Удалить ID {sc['card_id']} ({sc['nickname']})", callback_data=f"del_sp_card_{sc['card_id']}")])
-
-    buttons.append([InlineKeyboardButton("➕ Добавить карточку в стартовый пак", callback_data="add_sp_card_prompt")])
-    buttons.append([InlineKeyboardButton("🔙 Назад в меню карточек", callback_data="back_to_card_admin")])
-
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-    return STARTER_PACK_CONFIG_MENU
-
-async def admin_starter_pack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "back_to_card_admin":
-        await query.message.edit_text("⚙️ **Раздел управления карточками:**", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
-        return CARD_ADMIN_MENU
-
-    elif data == "add_sp_card_prompt":
-        await query.message.reply_text("🆔 Введите ID карточки, которую хотите добавить в стартовый набор:")
-        return STARTER_PACK_SELECT_CARD
-
-    elif data.startswith("del_sp_card_"):
-        card_id = int(data.split("_")[3])
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("DELETE FROM starter_pack_cards WHERE card_id = %s", (card_id,))
-        conn.commit()
-        conn.close()
-
-        await query.answer("✅ Карточка удалена из стартового набора!")
-        # Перерисовываем меню
-        conn = get_db()
-        c = conn.cursor()
-        c.execute('''
-            SELECT sp.card_id, c.nickname, c.ovr, c.rarity, c.position 
-            FROM starter_pack_cards sp
-            JOIN cards c ON sp.card_id = c.id
-        ''')
-        sp_cards = c.fetchall()
-        conn.close()
-
-        text = "🎁 **Настройка Стартового Набора (/freepack):**\n\nТекущие карточки в стартовом паке:\n"
-        buttons = []
-        if not sp_cards:
-            text += "📭 В стартовом паке пока нет карточек.\n"
-        else:
-            for sc in sp_cards:
-                text += f"• ID `{sc['card_id']}` | **{sc['nickname']}** ({sc['position']}, {sc['ovr']} OVR) [{sc['rarity']}]\n"
-                buttons.append([InlineKeyboardButton(f"❌ Удалить ID {sc['card_id']} ({sc['nickname']})", callback_data=f"del_sp_card_{sc['card_id']}")])
-
-        buttons.append([InlineKeyboardButton("➕ Добавить карточку в стартовый пак", callback_data="add_sp_card_prompt")])
-        buttons.append([InlineKeyboardButton("🔙 Назад в меню карточек", callback_data="back_to_card_admin")])
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-        return STARTER_PACK_CONFIG_MENU
-
-async def admin_starter_pack_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        card_id = int(update.message.text.strip())
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT id, nickname, ovr FROM cards WHERE id = %s", (card_id,))
-        cd = c.fetchone()
-        if not cd:
-            conn.close()
-            await update.message.reply_text("❌ Карточка с таким ID не найдена в базе!")
-            return STARTER_PACK_SELECT_CARD
-
-        c.execute("INSERT INTO starter_pack_cards (card_id) VALUES (%s) ON CONFLICT DO NOTHING", (card_id,))
-        conn.commit()
-        conn.close()
-
-        await update.message.reply_text(f"✅ Карточка **{cd['nickname']}** (ID {card_id}, {cd['ovr']} OVR) успешно добавлена в стартовый набор!")
-        
-        # Показываем обновленное меню снова
-        conn = get_db()
-        c = conn.cursor()
-        c.execute('''
-            SELECT sp.card_id, c.nickname, c.ovr, c.rarity, c.position 
-            FROM starter_pack_cards sp
-            JOIN cards c ON sp.card_id = c.id
-        ''')
-        sp_cards = c.fetchall()
-        conn.close()
-
-        text = "🎁 **Настройка Стартового Набора (/freepack):**\n\nТекущие карточки в стартовом паке:\n"
-        buttons = []
-        if not sp_cards:
-            text += "📭 В стартовом паке пока нет карточек.\n"
-        else:
-            for sc in sp_cards:
-                text += f"• ID `{sc['card_id']}` | **{sc['nickname']}** ({sc['position']}, {sc['ovr']} OVR) [{sc['rarity']}]\n"
-                buttons.append([InlineKeyboardButton(f"❌ Удалить ID {sc['card_id']} ({sc['nickname']})", callback_data=f"del_sp_card_{sc['card_id']}")])
-
-        buttons.append([InlineKeyboardButton("➕ Добавить карточку в стартовый пак", callback_data="add_sp_card_prompt")])
-        buttons.append([InlineKeyboardButton("🔙 Назад в меню карточек", callback_data="back_to_card_admin")])
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-        return STARTER_PACK_CONFIG_MENU
-
-    except ValueError:
-        await update.message.reply_text("❌ Введите ID числом!")
-        return STARTER_PACK_SELECT_CARD
-
 # ---------- ПРОФИЛЬ И СОСТАВ (/profile) ----------
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -2469,7 +2283,7 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await query.answer("✅ Карточка успешно установлена!")
         await show_profile(update, context)
 
-# ---------- МАТЧИ И ПОИСК СОПЕРНИКА (/cardmatch) С НАЧИСЛЕНИЕМ 100 RPLCOIN ЗА ГОЛ ----------
+# ---------- МАТЧИ И ПОИСК СОПЕРНИКА (/cardmatch) С КНОПКОЙ ПОЛУЧЕНИЯ СТАРТОВОГО НАБОРА ----------
 active_searches = {}
 active_games = set()
 
@@ -2536,13 +2350,13 @@ async def cardmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not roster or not (roster['goalie_id'] and roster['skater1_id'] and roster['skater2_id'] and roster['skater3_id'] and roster['skater4_id']):
-        kb_freepack = InlineKeyboardMarkup([
+        kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🎁 Получить стартовый набор карточек", callback_data="claim_freepack_btn")]
         ])
         await update.message.reply_text(
-            "❌ Вы не можете играть! У вас полностью не собран состав (нужен 1 Вратарь + 4 Полевых).\n"
-            "Нажмите кнопку ниже, чтобы получить бесплатный стартовый набор карточек!",
-            reply_markup=kb_freepack,
+            "❌ **Вы не можете играть!** У вас полностью не собран состав (нужен 1 Вратарь + 4 Полевых).\n"
+            "Нажмите кнопку ниже, чтобы получить стартовый набор бесплатно:",
+            reply_markup=kb,
             parse_mode="Markdown"
         )
         return
@@ -2627,13 +2441,6 @@ async def match_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     user = query.from_user
     data = query.data
 
-    if data == "claim_freepack_btn":
-        await query.answer()
-        # Вызываем логику выдачи стартового набора внутри callback
-        fake_update = update
-        await freepack_command(fake_update, context)
-        return
-
     if data.startswith("cancel_match_"):
         host_id = int(data.split("_")[2])
         if user.id != host_id:
@@ -2666,15 +2473,7 @@ async def match_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         conn.close()
 
         if not roster or not (roster['goalie_id'] and roster['skater1_id'] and roster['skater2_id'] and roster['skater3_id'] and roster['skater4_id']):
-            kb_freepack = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎁 Получить стартовый набор карточек", callback_data="claim_freepack_btn")]
-            ])
-            await query.message.reply_text(
-                "❌ У вас не собран полный состав (1 Вратарь + 4 Полевых)! Нажмите кнопку ниже для получения стартового набора.",
-                reply_markup=kb_freepack,
-                parse_mode="Markdown"
-            )
-            await query.answer()
+            await query.answer("❌ У вас не собран полный состав (1 Вратарь + 4 Полевых)! Соберите состав в /profile.", show_alert=True)
             return
 
         s_info = active_searches.pop(host_id)
@@ -3355,19 +3154,15 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         conn = get_db()
         c = conn.cursor()
 
-        # Транзакционная безопасность (FOR UPDATE)
-        c.execute("SELECT * FROM packs WHERE id = %s FOR UPDATE", (pack_id,))
+        c.execute("SELECT * FROM packs WHERE id = %s", (pack_id,))
         pack = c.fetchone()
-        
-        c.execute("SELECT balance FROM users WHERE user_id = %s FOR UPDATE", (user.id,))
-        u_row = c.fetchone()
+        c.execute("SELECT balance FROM users WHERE user_id = %s", (user.id,))
+        u_bal = c.fetchone()['balance']
 
-        if not pack or not u_row:
+        if not pack:
             conn.close()
-            await query.answer("❌ Пак или пользователь не найден!", show_alert=True)
+            await query.answer("❌ Пак не найден!", show_alert=True)
             return
-
-        u_bal = u_row['balance']
 
         if u_bal < pack['price']:
             conn.close()
@@ -3449,6 +3244,37 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await context.bot.send_message(chat_id=user.id, text=caption, parse_mode="Markdown")
 
         await show_shop(update, context)
+
+# ---------- АДМИНКА: НАСТРОЙКА СТАРТОВОГО НАБОРА ----------
+async def admin_freepack_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📦 **Настройка стартового набора:**\n"
+        "Введите ID карточек через пробел, которые будут выдаваться новым игрокам при получении стартового набора (желательно 1 Вратарь + 4 Полевых):\n"
+        "Пример: `1 2 3 4 5`",
+        parse_mode="Markdown"
+    )
+    return FREEPACK_ADMIN_SELECT_CARDS
+
+async def admin_freepack_setup_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        card_ids = [int(x) for x in update.message.text.strip().split()]
+        if not card_ids:
+            await update.message.reply_text("❌ Введите хотя бы один ID карточки!")
+            return FREEPACK_ADMIN_SELECT_CARDS
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("DELETE FROM freepack_config")
+        for cid in card_ids:
+            c.execute("INSERT INTO freepack_config (card_id) VALUES (%s) ON CONFLICT DO NOTHING", (cid,))
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(f"✅ Стартовый набор успешно обновлен! Содержит карточки ID: {card_ids}", reply_markup=card_admin_keyboard())
+        return CARD_ADMIN_MENU
+    except ValueError:
+        await update.message.reply_text("❌ Введите ID карточек числами через пробел!")
+        return FREEPACK_ADMIN_SELECT_CARDS
 
 # ---------- АДМИНКАТОР И ВЫСТАВЛЕНИЕ ПАКОВ НА ВРЕМЯ ----------
 async def admin_set_pack_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3532,6 +3358,9 @@ async def admin_card_menu_handler(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("📦 Введите название пака:")
         return ADD_PACK_NAME
 
+    elif text == "📦 Настроить стартовый набор":
+        return await admin_freepack_setup_start(update, context)
+
     elif text == "🎁 Выдать карточку игроку":
         await update.message.reply_text("🎁 Введите ID/@username пользователя и ID карточки через пробел (например: `@username 5` или `123456789 5`):", parse_mode="Markdown")
         return GRANT_CARD_DATA
@@ -3543,9 +3372,6 @@ async def admin_card_menu_handler(update: Update, context: ContextTypes.DEFAULT_
     elif text == "🎟 Создать промокод":
         await admin_create_promo_start(update, context)
         return ADD_PROMO_CODE
-
-    elif text == "🎁 Настройка стартового набора":
-        return await admin_starter_pack_menu(update, context)
 
     elif text == "⬅️ Выйти из настройки карточек":
         await update.message.reply_text("⚙️ Админ-панель:", reply_markup=admin_menu_keyboard())
@@ -4113,6 +3939,7 @@ def main():
             WAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_password)],
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
     )
     app.add_handler(conv_auth)
 
@@ -4120,6 +3947,7 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить каналы$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={WAITING_CHANNEL_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_username)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
     )
     app.add_handler(conv_channel)
 
@@ -4127,6 +3955,7 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить чаты$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={WAITING_CHAT_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_chat_link)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
     )
     app.add_handler(conv_chat)
 
@@ -4134,6 +3963,7 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^🔍 Инвентарь игрока$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={WAITING_VIEW_USER_INV: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_view_inventory_execute)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
     )
     app.add_handler(conv_user_inv)
 
@@ -4141,6 +3971,7 @@ def main():
         entry_points=[CallbackQueryHandler(inline_callback, pattern="^support$")],
         states={WAITING_SUPPORT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_receive)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
     )
     app.add_handler(conv_support)
 
@@ -4148,6 +3979,7 @@ def main():
         entry_points=[CallbackQueryHandler(inline_callback, pattern="^duel$")],
         states={WAITING_DUEL_SHOT: [CallbackQueryHandler(duel_shot, pattern="^shot_")]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
     )
     app.add_handler(conv_duel)
 
@@ -4158,6 +3990,7 @@ def main():
         ],
         states={WAITING_PROMO_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_input_receive)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
     )
     app.add_handler(conv_promo_user)
 
@@ -4165,6 +3998,7 @@ def main():
         entry_points=[CallbackQueryHandler(market_callback_handler, pattern="^select_mcard_")],
         states={WAITING_MARKET_PRICE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, execute_market_list_price)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
     )
     app.add_handler(conv_market_price)
 
@@ -4172,6 +4006,7 @@ def main():
         entry_points=[CallbackQueryHandler(trade_callback_handler, pattern="^tr_addmoney_")],
         states={WAITING_TRADE_MONEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, execute_trade_money_input)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
     )
     app.add_handler(conv_trade_money)
 
@@ -4182,6 +4017,7 @@ def main():
         ],
         states={WAITING_RPS_BET: [MessageHandler(filters.TEXT & ~filters.COMMAND, rps_receive_bet)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
     )
     app.add_handler(conv_rps)
 
@@ -4194,23 +4030,14 @@ def main():
             ADMIN_SHOP_PACK_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_shop_pack_hours_receive)]
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
     )
     app.add_handler(conv_admin_shop_pack)
 
     conv_cards = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🃏 Карточки$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={
-            CARD_ADMIN_MENU: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_card_menu_handler),
-                CallbackQueryHandler(admin_starter_pack_callback, pattern="^(back_to_card_admin|add_sp_card_prompt|del_sp_card_)")
-            ],
-            STARTER_PACK_CONFIG_MENU: [
-                CallbackQueryHandler(admin_starter_pack_callback, pattern="^(back_to_card_admin|add_sp_card_prompt|del_sp_card_)")
-            ],
-            STARTER_PACK_SELECT_CARD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_starter_pack_add_receive),
-                CallbackQueryHandler(admin_starter_pack_callback, pattern="^(back_to_card_admin|add_sp_card_prompt|del_sp_card_)")
-            ],
+            CARD_ADMIN_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_card_menu_handler)],
             ADD_COLLECTION_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_collection)],
             ADD_TEAM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_team_name)],
             ADD_TEAM_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_team_emoji)],
@@ -4230,6 +4057,7 @@ def main():
             ADD_PACK_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pack_set_limit)],
             ADD_PACK_CARDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, pack_set_cards)],
             ADD_PACK_PHOTO: [MessageHandler(filters.PHOTO, pack_save_all)],
+            FREEPACK_ADMIN_SELECT_CARDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_freepack_setup_receive)],
             GRANT_CARD_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, grant_card_execute)],
             GIVE_MONEY_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, give_money_execute)],
             ADD_PRO_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_promo_set_code)],
@@ -4240,6 +4068,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         allow_reentry=True,
+        per_message=False,
     )
     app.add_handler(conv_cards)
 
@@ -4256,7 +4085,7 @@ def main():
     app.add_handler(CommandHandler("cardmmr", cardmmr_command))
     app.add_handler(CommandHandler("shop", shop_command))
     app.add_handler(CommandHandler("cardshop", cardshop_command))
-    app.add_handler(CommandHandler.to_dict('trade') if hasattr(CommandHandler, 'to_dict') else CommandHandler("trade", trade_command))
+    app.add_handler(CommandHandler("trade", trade_command))
     app.add_handler(CommandHandler("daily", daily_command))
     app.add_handler(CommandHandler("wheel", wheel_command))
     app.add_handler(CommandHandler("rps", rps_command))
@@ -4280,8 +4109,9 @@ def main():
     app.add_handler(CallbackQueryHandler(market_callback_handler, pattern="^(refresh_market|my_market_items|market_list_menu|cancel_market_|buy_market_)"))
     app.add_handler(CallbackQueryHandler(trade_callback_handler, pattern="^(accept_trade_|decline_trade_|tr_)"))
     app.add_handler(CallbackQueryHandler(profile_callback_handler, pattern="^(refresh_profile|edit_roster_menu|set_pos_|apply_card_)"))
-    app.add_handler(CallbackQueryHandler(match_callback_handler, pattern="^(accept_match_|cancel_match_|claim_freepack_btn)"))
+    app.add_handler(CallbackQueryHandler(match_callback_handler, pattern="^(accept_match_|cancel_match_)"))
     app.add_handler(CallbackQueryHandler(shop_callback_handler, pattern="^(preview_pack_|confirm_pack_|cancel_pack_buy)"))
+    app.add_handler(CallbackQueryHandler(freepack_callback_handler, pattern="^claim_freepack_btn$"))
     app.add_handler(CallbackQueryHandler(rps_callback_handler, pattern="^rps_"))
     app.add_handler(CallbackQueryHandler(admin_shop_pack_callback, pattern="^adm_pack_"))
     app.add_handler(CallbackQueryHandler(inline_callback))
