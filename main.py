@@ -4060,7 +4060,6 @@ def main():
             FREEPACK_ADMIN_SELECT_CARDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_freepack_setup_receive)],
             GRANT_CARD_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, grant_card_execute)],
             GIVE_MONEY_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, give_money_execute)],
-            ADD_PRO_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_promo_set_code)],
             ADD_PROMO_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_promo_set_code)],
             ADD_PROMO_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_promo_set_type)],
             ADD_PROMO_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_promo_set_val)],
