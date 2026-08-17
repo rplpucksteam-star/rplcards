@@ -1,3 +1,4 @@
+```python
 import os
 import logging
 import asyncio
@@ -96,12 +97,14 @@ SELL_PRICES = {
     WAITING_TRADE_TARGET,
     WAITING_TRADE_MONEY,
     WAITING_MARKET_PRICE_INPUT,
-    # Мини-игра КНБ ставка
+    # Мини-игры
     WAITING_RPS_BET,
+    WAITING_SLOTS_BET,
+    WAITING_DICE_BET,
     # Админ выставление паков на время
     ADMIN_SHOP_PACK_SELECT,
     ADMIN_SHOP_PACK_HOURS,
-) = range(44)
+) = range(46)
 
 # ---------- БД (PostgreSQL) ----------
 def get_db():
@@ -552,7 +555,6 @@ async def grant_free_pack_to_user(user_id, context):
     conf_cards = c.fetchall()
 
     if not conf_cards:
-        # Если админ не настроил стартовый набор, выдаем автоматический набор (1 Вратарь + 4 Полевых)
         c.execute("SELECT id FROM cards WHERE position = 'Goalie' LIMIT 1")
         g_card = c.fetchone()
         c.execute("SELECT id FROM cards WHERE position = 'Skater' LIMIT 4")
@@ -568,7 +570,6 @@ async def grant_free_pack_to_user(user_id, context):
     for cid in card_ids:
         c.execute("INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1) ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1", (user_id, cid))
 
-    # Автоматически заполняем состав игрока карточками из набора
     c.execute("SELECT * FROM cards WHERE id IN %s", (tuple(card_ids),))
     all_issued_cards = c.fetchall()
     
@@ -651,7 +652,7 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
-        elif diff.total_seconds() > 172800: # Прошло больше 48 часов — сброс стрика
+        elif diff.total_seconds() > 172800:
             streak = 0
 
     streak = (streak % 7) + 1
@@ -726,7 +727,7 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if isinstance(last_spin, str):
             last_spin = datetime.fromisoformat(last_spin)
         diff = now - last_spin
-        if diff.total_seconds() < 129600: # 36 часов
+        if diff.total_seconds() < 129600:
             rem = timedelta(seconds=129600) - diff
             hours, rem_sec = divmod(int(rem.total_seconds()), 3600)
             minutes = rem_sec // 60
@@ -906,13 +907,14 @@ async def rps_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.edit_text("❌ Ошибка: недостаточно средств для выплаты ставки.")
         return
 
+    # Защищенная логика шансов с псевдорандомом и смещением
     rand_val = random.random()
-    if rand_val < 0.5:
+    if rand_val < 0.42:
         if player_choice == "rock": bot_choice = "scissors"
         elif player_choice == "scissors": bot_choice = "paper"
         else: bot_choice = "rock"
         result = "win"
-    elif rand_val < 0.75:
+    elif rand_val < 0.58:
         bot_choice = player_choice
         result = "draw"
     else:
@@ -942,6 +944,161 @@ async def rps_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         f"{res_str}"
     )
     await query.message.edit_text(text, parse_mode="Markdown")
+
+# ---------- МИНИ-ИГРА СЛОТЫ ----------
+async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+    await update.message.reply_text("🎰 **Игровые Слоты**\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown")
+    return WAITING_SLOTS_BET
+
+async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        bet = int(update.message.text.strip())
+        if bet <= 0:
+            await update.message.reply_text("❌ Ставка должна быть больше 0!")
+            return WAITING_SLOTS_BET
+
+        user = update.effective_user
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE user_id = %s", (user.id,))
+        u_bal = c.fetchone()['balance']
+        conn.close()
+
+        if bet > u_bal:
+            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.")
+            return WAITING_SLOTS_BET
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (bet, user.id))
+        conn.commit()
+        conn.close()
+
+        msg = await update.message.reply_text("🎰 | 🔄 | 🔄 | 🔄 |\nКрутим слоты...", parse_mode="Markdown")
+        await asyncio.sleep(2)
+
+        symbols = ["🏒", "🥅", "⭐", "🍒", "7️⃣", "💎"]
+        
+        # Скрытые шансы для слотов
+        r = random.random()
+        if r < 0.03:
+            sym = random.choice(["7️⃣", "💎", "⭐"])
+            line = [sym, sym, sym]
+            mult = 10
+        elif r < 0.15:
+            sym = random.choice(symbols)
+            line = [sym, sym, sym]
+            mult = 5
+        elif r < 0.40:
+            sym = random.choice(symbols)
+            line = [sym, sym, random.choice([s for s in symbols if s != sym])]
+            mult = 2
+        else:
+            line = random.choices(symbols, k=3)
+            if line[0] == line[1] == line[2]:
+                mult = 4
+            elif line[0] == line[1] or line[1] == line[2] or line[0] == line[2]:
+                mult = 1.5
+            else:
+                mult = 0
+
+        conn = get_db()
+        c = conn.cursor()
+        if mult > 0:
+            win_amount = int(bet * mult)
+            c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (win_amount, user.id))
+            conn.commit()
+            conn.close()
+            res_text = f"🎰 | {line[0]} | {line[1]} | {line[2]} |\n\n🎉 **ПОБЕДА!** Вы выиграли **{win_amount} RPLCoin** (Множитель x{mult})!"
+        else:
+            conn.close()
+            res_text = f"🎰 | {line[0]} | {line[1]} | {line[2]} |\n\n❌ **ПРОИГРЫШ!** Вы потеряли ставку **{bet} RPLCoin**."
+
+        await msg.edit_text(res_text, parse_mode="Markdown")
+        return ConversationHandler.END
+
+    except ValueError:
+        await update.message.reply_text("❌ Введите ставку числом!")
+        return WAITING_SLOTS_BET
+
+# ---------- МИНИ-ИГРА КОСТИ ----------
+async def dice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+    await update.message.reply_text("🎲 **Игра в Кости**\nСначала бросает бот, затем бот бросает за вас!\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown")
+    return WAITING_DICE_BET
+
+async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        bet = int(update.message.text.strip())
+        if bet <= 0:
+            await update.message.reply_text("❌ Ставка должна быть больше 0!")
+            return WAITING_DICE_BET
+
+        user = update.effective_user
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE user_id = %s", (user.id,))
+        u_bal = c.fetchone()['balance']
+        conn.close()
+
+        if bet > u_bal:
+            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.")
+            return WAITING_DICE_BET
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (bet, user.id))
+        conn.commit()
+        conn.close()
+
+        msg = await update.message.reply_text("🎲 Бот готовится к броску...", parse_mode="Markdown")
+        await asyncio.sleep(2)
+
+        # Скрытые шансы для костей (нечитаемые)
+        r = random.random()
+        if r < 0.40:
+            bot_val = random.randint(1, 4)
+            player_val = random.randint(bot_val + 1, 6)
+            res = "win"
+        elif r < 0.65:
+            bot_val = random.randint(3, 6)
+            player_val = bot_val
+            res = "draw"
+        else:
+            bot_val = random.randint(3, 6)
+            player_val = random.randint(1, bot_val - 1)
+            res = "lose"
+
+        await msg.edit_text(f"🤖 Бот бросает кости...\n🎲 Результат бота: **{bot_val}**", parse_mode="Markdown")
+        await asyncio.sleep(2.5)
+
+        conn = get_db()
+        c = conn.cursor()
+
+        if res == "win":
+            win_amount = bet * 2
+            c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (win_amount, user.id))
+            conn.commit()
+            conn.close()
+            final_str = f"🎉 **ПОБЕДА!** Бот бросил {bot_val}, а за вас выпало **{player_val}**!\nВы выиграли **{win_amount} RPLCoin**!"
+        elif res == "lose":
+            conn.close()
+            final_str = f"❌ **ПОРАЖЕНИЕ!** Бот бросил {bot_val}, а за вас выпало **{player_val}**.\nВы потеряли ставку **{bet} RPLCoin**."
+        else:
+            c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (bet, user.id))
+            conn.commit()
+            conn.close()
+            final_str = f"🤝 **НИЧЬЯ!** У вас и у бота выпало по **{bot_val}**.\nСтавка возвращена на баланс."
+
+        await update.message.reply_text(final_str, parse_mode="Markdown")
+        return ConversationHandler.END
+
+    except ValueError:
+        await update.message.reply_text("❌ Введите ставку числом!")
+        return WAITING_DICE_BET
 
 # ---------- ПРОФИЛЬ И СОСТАВ (/profile И /checkprofile) ----------
 async def checkprofile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2463,7 +2620,7 @@ async def match_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         if host_id not in active_searches:
-            await query.answer("❌ Этот поиск уже неактивен!", show_alert=True)
+            await query.answer("❌ Этот поиск уже неактуален!", show_alert=True)
             return
 
         conn = get_db()
@@ -3768,7 +3925,9 @@ async def minigames_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎮 Камень-Ножницы-Бумага", callback_data="play_rps")]
+        [InlineKeyboardButton("🎮 Камень-Ножницы-Бумага", callback_data="play_rps")],
+        [InlineKeyboardButton("🎰 Слоты", callback_data="play_slots")],
+        [InlineKeyboardButton("🎲 Кости", callback_data="play_dice")]
     ])
     await update.message.reply_text("🕹 **Выберите мини-игру:**", reply_markup=kb, parse_mode="Markdown")
 
@@ -3909,6 +4068,12 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "play_rps":
         await query.message.reply_text("🎮 **Камень - Ножницы - Бумага**\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown")
         return WAITING_RPS_BET
+    elif data == "play_slots":
+        await query.message.reply_text("🎰 **Игровые Слоты**\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown")
+        return WAITING_SLOTS_BET
+    elif data == "play_dice":
+        await query.message.reply_text("🎲 **Игра в Кости**\nСначала бросает бот, затем бот бросает за вас!\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown")
+        return WAITING_DICE_BET
 
 async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -4020,6 +4185,22 @@ def main():
         per_message=False,
     )
     app.add_handler(conv_rps)
+
+    conv_slots = ConversationHandler(
+        entry_points=[CallbackQueryHandler(inline_callback, pattern="^play_slots$")],
+        states={WAITING_SLOTS_BET: [MessageHandler(filters.TEXT & ~filters.COMMAND, slots_receive_bet)]},
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
+    )
+    app.add_handler(conv_slots)
+
+    conv_dice = ConversationHandler(
+        entry_points=[CallbackQueryHandler(inline_callback, pattern="^play_dice$")],
+        states={WAITING_DICE_BET: [MessageHandler(filters.TEXT & ~filters.COMMAND, dice_receive_bet)]},
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
+    )
+    app.add_handler(conv_dice)
 
     conv_admin_shop_pack = ConversationHandler(
         entry_points=[
