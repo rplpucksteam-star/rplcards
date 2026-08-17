@@ -4,7 +4,7 @@ import asyncio
 import random
 import time
 from datetime import datetime, timedelta
-import psycopg2ФЫВАФЫВАФЫВА
+import psycopg2
 from psycopg2.extras import RealDictCursor
 
 from telegram import (
@@ -48,6 +48,13 @@ SELL_PRICES = {
     "Легендарная": 12000,
     "Секретная": 25000
 }
+
+MENU_BUTTONS = [
+    "🏠 Главное меню", "🃏 Бесплатная карта", "🎒 Инвентарь", "🛒 Торговая площадка",
+    "🏒 Состав и Профиль", "⚔️ Искать игру", "🛒 Магазин Паков", "🏆 Топ MMR",
+    "🤝 Трейд", "🎁 Промокод", "🎮 Мини-игры", "🎡 Колесо удачи", "🎁 Ежедневный бонус",
+    "◀️ Назад", "🔙 Назад", "◀️ Назад в меню"
+]
 
 # Состояния ConversationHandler
 (
@@ -126,9 +133,11 @@ def init_db():
             daily_streak INTEGER DEFAULT 0,
             last_wheel_spin TIMESTAMP,
             free_card_cooldown_reset_until TIMESTAMP,
-            freepack_claimed BOOLEAN DEFAULT FALSE
+            freepack_claimed BOOLEAN DEFAULT FALSE,
+            custom_card_claimed BOOLEAN DEFAULT FALSE
         )
     ''')
+    c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_card_claimed BOOLEAN DEFAULT FALSE")
     
     # Существующие системы
     c.execute('''
@@ -497,6 +506,9 @@ def main_menu_keyboard():
         ["🎁 Ежедневный бонус"]
     ], resize_keyboard=True)
 
+def cancel_keyboard():
+    return ReplyKeyboardMarkup([["◀️ Назад в меню"]], resize_keyboard=True)
+
 def admin_menu_keyboard():
     return ReplyKeyboardMarkup([
         ["➕ Добавить каналы", "➕ Добавить чаты"],
@@ -530,7 +542,8 @@ def duel_shot_keyboard():
         [InlineKeyboardButton("🥅 Левая девятка", callback_data="shot_left")],
         [InlineKeyboardButton("🥅 Правая девятка", callback_data="shot_right")],
         [InlineKeyboardButton("🧤 Домик (между щитков)", callback_data="shot_five")],
-        [InlineKeyboardButton("🥅 Низ в угол", callback_data="shot_low")]
+        [InlineKeyboardButton("🥅 Низ в угол", callback_data="shot_low")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main_inline")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -713,7 +726,7 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT balance, last_wheel_spin FROM users WHERE user_id = %s", (user.id,))
+    c.execute("SELECT balance, last_wheel_spin, custom_card_claimed FROM users WHERE user_id = %s", (user.id,))
     u_row = c.fetchone()
     conn.close()
 
@@ -748,6 +761,11 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prizes = ["reset_cd", "money", "card_50_65", "card_70_80", "card_80_85", "discount", "custom_card", "rare", "very_rare", "epic", "mythic", "nothing"]
     prize = random.choice(prizes)
+
+    # Приз "custom_card" может выпасть ТОЛЬКО 1 РАЗ за всё время
+    if prize == "custom_card" and u_row.get('custom_card_claimed'):
+        other_prizes = [p for p in prizes if p != "custom_card"]
+        prize = random.choice(other_prizes)
 
     conn = get_db()
     c = conn.cursor()
@@ -795,7 +813,8 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disc = random.randint(1, 30)
         prize_text = f"🏷 **Скидка {disc}%** на любую покупку в магазине!"
     elif prize == "custom_card":
-        prize_text = "🎨 **Создание своей карты с рейтингом до 82!** Свяжитесь с администратором @admin для создания."
+        c.execute("UPDATE users SET custom_card_claimed = TRUE WHERE user_id = %s", (user.id,))
+        prize_text = "🎨 **Создание своей карты с рейтингом до 82!** Свяжитесь с администратором для создания. (Выпадает 1 раз за всё время)"
     elif prize == "rare":
         c.execute("SELECT * FROM cards WHERE rarity = 'Редкая'")
         cds = c.fetchall()
@@ -851,14 +870,19 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rps_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
-    await update.message.reply_text("🎮 **Камень - Ножницы - Бумага**\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown")
+    await update.message.reply_text("🎮 **Камень - Ножницы - Бумага**\nВведите ставку в RPLCoin (целое число):", reply_markup=cancel_keyboard(), parse_mode="Markdown")
     return WAITING_RPS_BET
 
 async def rps_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text_input = update.message.text.strip()
+    if text_input in MENU_BUTTONS or text_input.startswith("/"):
+        await update.message.reply_text("❌ Ввод ставки отменен.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
     try:
-        bet = int(update.message.text.strip())
+        bet = int(text_input)
         if bet <= 0:
-            await update.message.reply_text("❌ Ставка должна быть больше 0!")
+            await update.message.reply_text("❌ Ставка должна быть больше 0!", reply_markup=cancel_keyboard())
             return WAITING_RPS_BET
 
         user = update.effective_user
@@ -869,7 +893,7 @@ async def rps_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
         if bet > u_bal:
-            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.")
+            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.", reply_markup=cancel_keyboard())
             return WAITING_RPS_BET
 
         context.user_data["rps_bet"] = bet
@@ -881,7 +905,7 @@ async def rps_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Ставка принята: **{bet} RPLCoin**.\nВыберите ваш ход:", reply_markup=kb, parse_mode="Markdown")
         return ConversationHandler.END
     except ValueError:
-        await update.message.reply_text("❌ Введите ставку числом!")
+        await update.message.reply_text("❌ Введите ставку числом или нажмите '◀️ Назад в меню'!", reply_markup=cancel_keyboard())
         return WAITING_RPS_BET
 
 async def rps_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -906,7 +930,6 @@ async def rps_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.edit_text("❌ Ошибка: недостаточно средств для выплаты ставки.")
         return
 
-    # Защищенная логика шансов с псевдорандомом и смещением
     rand_val = random.random()
     if rand_val < 0.42:
         if player_choice == "rock": bot_choice = "scissors"
@@ -948,14 +971,19 @@ async def rps_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
-    await update.message.reply_text("🎰 **Игровые Слоты**\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown")
+    await update.message.reply_text("🎰 **Игровые Слоты**\nВведите ставку в RPLCoin (целое число):", reply_markup=cancel_keyboard(), parse_mode="Markdown")
     return WAITING_SLOTS_BET
 
 async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text_input = update.message.text.strip()
+    if text_input in MENU_BUTTONS or text_input.startswith("/"):
+        await update.message.reply_text("❌ Ввод ставки отменен.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
     try:
-        bet = int(update.message.text.strip())
+        bet = int(text_input)
         if bet <= 0:
-            await update.message.reply_text("❌ Ставка должна быть больше 0!")
+            await update.message.reply_text("❌ Ставка должна быть больше 0!", reply_markup=cancel_keyboard())
             return WAITING_SLOTS_BET
 
         user = update.effective_user
@@ -966,7 +994,7 @@ async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
         if bet > u_bal:
-            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.")
+            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.", reply_markup=cancel_keyboard())
             return WAITING_SLOTS_BET
 
         conn = get_db()
@@ -975,33 +1003,20 @@ async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
 
-        msg = await update.message.reply_text("🎰 | 🔄 | 🔄 | 🔄 |\nКрутим слоты...", parse_mode="Markdown")
+        msg = await update.message.reply_text("🎰 | 🔄 | 🔄 | 🔄 |\nКрутим слоты...", reply_markup=main_menu_keyboard(), parse_mode="Markdown")
         await asyncio.sleep(2)
 
         symbols = ["🏒", "🥅", "⭐", "🍒", "7️⃣", "💎"]
         
-        # Скрытые шансы для слотов
+        # Шанс выигрыша в слотах — 25% (0.25)
         r = random.random()
-        if r < 0.03:
-            sym = random.choice(["7️⃣", "💎", "⭐"])
-            line = [sym, sym, sym]
-            mult = 10
-        elif r < 0.15:
+        if r < 0.25:
             sym = random.choice(symbols)
             line = [sym, sym, sym]
-            mult = 5
-        elif r < 0.40:
-            sym = random.choice(symbols)
-            line = [sym, sym, random.choice([s for s in symbols if s != sym])]
-            mult = 2
+            mult = 3
         else:
-            line = random.choices(symbols, k=3)
-            if line[0] == line[1] == line[2]:
-                mult = 4
-            elif line[0] == line[1] or line[1] == line[2] or line[0] == line[2]:
-                mult = 1.5
-            else:
-                mult = 0
+            line = random.sample(symbols, k=3)
+            mult = 0
 
         conn = get_db()
         c = conn.cursor()
@@ -1019,21 +1034,26 @@ async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     except ValueError:
-        await update.message.reply_text("❌ Введите ставку числом!")
+        await update.message.reply_text("❌ Введите ставку числом или нажмите '◀️ Назад в меню'!", reply_markup=cancel_keyboard())
         return WAITING_SLOTS_BET
 
 # ---------- МИНИ-ИГРА КОСТИ ----------
 async def dice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
-    await update.message.reply_text("🎲 **Игра в Кости**\nСначала бросает бот, затем бот бросает за вас!\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown")
+    await update.message.reply_text("🎲 **Игра в Кости**\nСначала бросает бот, затем бот бросает за вас!\nВведите ставку в RPLCoin (целое число):", reply_markup=cancel_keyboard(), parse_mode="Markdown")
     return WAITING_DICE_BET
 
 async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text_input = update.message.text.strip()
+    if text_input in MENU_BUTTONS or text_input.startswith("/"):
+        await update.message.reply_text("❌ Ввод ставки отменен.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
     try:
-        bet = int(update.message.text.strip())
+        bet = int(text_input)
         if bet <= 0:
-            await update.message.reply_text("❌ Ставка должна быть больше 0!")
+            await update.message.reply_text("❌ Ставка должна быть больше 0!", reply_markup=cancel_keyboard())
             return WAITING_DICE_BET
 
         user = update.effective_user
@@ -1044,7 +1064,7 @@ async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
         if bet > u_bal:
-            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.")
+            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.", reply_markup=cancel_keyboard())
             return WAITING_DICE_BET
 
         conn = get_db()
@@ -1053,21 +1073,21 @@ async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
 
-        msg = await update.message.reply_text("🎲 Бот готовится к броску...", parse_mode="Markdown")
+        msg = await update.message.reply_text("🎲 Бот готовится к броску...", reply_markup=main_menu_keyboard(), parse_mode="Markdown")
         await asyncio.sleep(2)
 
-        # Скрытые шансы для костей (нечитаемые)
+        # Шанс выигрыша в костях — 25% (0.25)
         r = random.random()
-        if r < 0.40:
-            bot_val = random.randint(1, 4)
+        if r < 0.25:
+            bot_val = random.randint(1, 5)
             player_val = random.randint(bot_val + 1, 6)
             res = "win"
-        elif r < 0.65:
-            bot_val = random.randint(3, 6)
+        elif r < 0.40:
+            bot_val = random.randint(1, 6)
             player_val = bot_val
             res = "draw"
         else:
-            bot_val = random.randint(3, 6)
+            bot_val = random.randint(2, 6)
             player_val = random.randint(1, bot_val - 1)
             res = "lose"
 
@@ -1096,7 +1116,7 @@ async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     except ValueError:
-        await update.message.reply_text("❌ Введите ставку числом!")
+        await update.message.reply_text("❌ Введите ставку числом или нажмите '◀️ Назад в меню'!", reply_markup=cancel_keyboard())
         return WAITING_DICE_BET
 
 # ---------- ПРОФИЛЬ И СОСТАВ (/profile И /checkprofile) ----------
@@ -1189,7 +1209,7 @@ async def checkprofile_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💬 Написать в ЛС", url=f"https://t.me/{target_user['username']}" if target_user['username'] else f"tg://user?id={target_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="refresh_profile")]
+        [InlineKeyboardButton("🔙 Назад в профиль", callback_data="refresh_profile")]
     ])
 
     await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
@@ -1237,31 +1257,43 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     c = conn.cursor()
+    
+    # Не выдаем карту, которая уже есть у игрока (без повторок)
     c.execute('''
         SELECT c.*, col.name as collection_name, t.name as team_name, t.emoji as team_emoji
         FROM cards c
         JOIN collections col ON c.collection_id = col.id
         LEFT JOIN card_teams t ON c.team_id = t.id
-        WHERE c.rarity = %s
-    ''', (rarity,))
+        WHERE c.rarity = %s AND c.id NOT IN (
+            SELECT card_id FROM user_cards WHERE user_id = %s AND count > 0
+        )
+    ''', (rarity, user.id))
     cards = c.fetchall()
 
     if not cards:
+        # Если в данной редкости не осталось неуникальных, ищем неуникальную карту любой другой редкости
         c.execute('''
             SELECT c.*, col.name as collection_name, t.name as team_name, t.emoji as team_emoji
             FROM cards c
             JOIN collections col ON c.collection_id = col.id
             LEFT JOIN card_teams t ON c.team_id = t.id
-            WHERE c.rarity != 'Секретная'
-        ''')
+            WHERE c.rarity != 'Секретная' AND c.id NOT IN (
+                SELECT card_id FROM user_cards WHERE user_id = %s AND count > 0
+            )
+        ''', (user.id,))
         cards = c.fetchall()
 
     if not cards:
         conn.close()
-        await update.message.reply_text("📭 В базе пока нет карточек! Администратор скоро их добавит.")
+        await update.message.reply_text("🎉 Вы собрали все доступные карточки в игре! Выплачена компенсация: **25 000 RPLCoin**!", parse_mode="Markdown")
+        conn_b = get_db()
+        cb = conn_b.cursor()
+        cb.execute("UPDATE users SET balance = balance + 25000 WHERE user_id = %s", (user.id,))
+        conn_b.commit()
+        conn_b.close()
         return
 
-    card = choose_card_for_user(c, user.id, cards)
+    card = random.choice(cards)
     card_id = card['id']
 
     c.execute('''
@@ -1280,7 +1312,7 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     team_str = f"{card['team_emoji'] or '🏒'} {card['team_name']}" if card['team_name'] else "Без команды"
     
     caption = (
-        f"🔥 **Вам выпала карточка!**\n\n"
+        f"🔥 **Вам выпала НОВАЯ карточка!**\n\n"
         f"┏━━━━━━━━━━━━━━━━━━━━┓\n"
         f"┃ 👤 {card['nickname']}\n"
         f"┃ 📁 Коллекция: {card['collection_name']}\n"
@@ -1643,7 +1675,7 @@ async def market_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     elif data.startswith("select_mcard_"):
         card_id = int(data.split("_")[2])
         context.user_data["m_card_id"] = card_id
-        await query.message.reply_text("💲 **Введите цену продажи (в RPLCoin, максимум 999 999):**\nНапример: `1500`", parse_mode="Markdown")
+        await query.message.reply_text("💲 **Введите цену продажи (в RPLCoin, максимум 999 999):**\nНапример: `1500`", reply_markup=cancel_keyboard(), parse_mode="Markdown")
         return WAITING_MARKET_PRICE_INPUT
 
     elif data.startswith("cancel_market_"):
@@ -1721,10 +1753,15 @@ async def market_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await show_market(update, context)
 
 async def execute_market_list_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text_input = update.message.text.strip()
+    if text_input in MENU_BUTTONS or text_input.startswith("/"):
+        await update.message.reply_text("❌ Ввод цены отменен.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
     try:
-        price = int(update.message.text.strip())
+        price = int(text_input)
         if price <= 0 or price > 999999:
-            await update.message.reply_text("❌ Цена должна быть от 1 до 999 999 RPLCoin! Попробуйте снова:")
+            await update.message.reply_text("❌ Цена должна быть от 1 до 999 999 RPLCoin! Попробуйте снова:", reply_markup=cancel_keyboard())
             return WAITING_MARKET_PRICE_INPUT
 
         card_id = context.user_data.get("m_card_id")
@@ -1738,7 +1775,7 @@ async def execute_market_list_price(update: Update, context: ContextTypes.DEFAUL
 
         if not row:
             conn.close()
-            await update.message.reply_text("❌ У вас больше нет этой карточки!")
+            await update.message.reply_text("❌ У вас больше нет этой карточки!", reply_markup=main_menu_keyboard())
             return ConversationHandler.END
 
         c.execute("UPDATE user_cards SET count = count - 1 WHERE user_id = %s AND card_id = %s", (user.id, card_id))
@@ -1762,12 +1799,12 @@ async def execute_market_list_price(update: Update, context: ContextTypes.DEFAUL
         conn.commit()
         conn.close()
 
-        await update.message.reply_text(f"✅ **Карточка успешно выставлена за {price} RPLCoin на Торговую площадку!**", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ **Карточка успешно выставлена за {price} RPLCoin на Торговую площадку!**", reply_markup=main_menu_keyboard(), parse_mode="Markdown")
         await show_market(update, context)
         return ConversationHandler.END
 
     except ValueError:
-        await update.message.reply_text("❌ Введите цену целым числом (до 999 999):")
+        await update.message.reply_text("❌ Введите цену целым числом (до 999 999):", reply_markup=cancel_keyboard())
         return WAITING_MARKET_PRICE_INPUT
 
 # ---------- СИСТЕМА ТРЕЙДА (/trade) ----------
@@ -1992,7 +2029,7 @@ async def trade_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         elif action == "addmoney":
             context.user_data["active_trade_id"] = trade_id
-            await query.message.reply_text("💵 **Введите сумму RPLCoin для трейда:**", parse_mode="Markdown")
+            await query.message.reply_text("💵 **Введите сумму RPLCoin для трейда:**", reply_markup=cancel_keyboard(), parse_mode="Markdown")
             return WAITING_TRADE_MONEY
 
         elif action == "addcard":
@@ -2101,8 +2138,13 @@ async def execute_trade_finish(context, trade_id):
             pass
 
 async def execute_trade_money_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text_input = update.message.text.strip()
+    if text_input in MENU_BUTTONS or text_input.startswith("/"):
+        await update.message.reply_text("❌ Ввод суммы отменен.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
     try:
-        val = int(update.message.text.strip())
+        val = int(text_input)
         if val < 0:
             val = 0
 
@@ -2110,7 +2152,7 @@ async def execute_trade_money_input(update: Update, context: ContextTypes.DEFAUL
         trade_id = context.user_data.get("active_trade_id")
 
         if not trade_id or trade_id not in active_trades:
-            await update.message.reply_text("❌ Трейд не активен!")
+            await update.message.reply_text("❌ Трейд не активен!", reply_markup=main_menu_keyboard())
             return ConversationHandler.END
 
         tdata = active_trades[trade_id]
@@ -2121,7 +2163,7 @@ async def execute_trade_money_input(update: Update, context: ContextTypes.DEFAUL
         conn.close()
 
         if val > u_bal:
-            await update.message.reply_text(f"❌ У вас нет столько RPLCoin! Ваш баланс: {u_bal}")
+            await update.message.reply_text(f"❌ У вас нет столько RPLCoin! Ваш баланс: {u_bal}", reply_markup=cancel_keyboard())
             return WAITING_TRADE_MONEY
 
         if user.id == tdata['p1']:
@@ -2132,12 +2174,12 @@ async def execute_trade_money_input(update: Update, context: ContextTypes.DEFAUL
         tdata['p1_ready'] = False
         tdata['p2_ready'] = False
 
-        await update.message.reply_text(f"✅ Установлена сумма {val} RPLCoin.")
+        await update.message.reply_text(f"✅ Установлена сумма {val} RPLCoin.", reply_markup=main_menu_keyboard())
         await update_trade_views(context, trade_id)
         return ConversationHandler.END
 
     except ValueError:
-        await update.message.reply_text("❌ Введите сумму целым числом!")
+        await update.message.reply_text("❌ Введите сумму целым числом!", reply_markup=cancel_keyboard())
         return WAITING_TRADE_MONEY
 
 # ---------- ПРОМОКОДЫ (/promo) ----------
@@ -2153,11 +2195,15 @@ async def promo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_promo_code(update, context, user.id, code)
         return
 
-    await update.message.reply_text("🎟 **Введите ваш промокод:**", parse_mode="Markdown")
+    await update.message.reply_text("🎟 **Введите ваш промокод:**", reply_markup=cancel_keyboard(), parse_mode="Markdown")
     return WAITING_PROMO_INPUT
 
 async def promo_input_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text.strip().upper()
+    if code in MENU_BUTTONS or code.startswith("/"):
+        await update.message.reply_text("❌ Ввод промокода отменен.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
     user = update.effective_user
     await process_promo_code(update, context, user.id, code)
     return ConversationHandler.END
@@ -2171,7 +2217,7 @@ async def process_promo_code(update, context, user_id, code):
 
     if not promo:
         conn.close()
-        await update.message.reply_text("❌ Введен несуществующий или недействительный промокод!")
+        await update.message.reply_text("❌ Введен несуществующий или недействительный промокод!", reply_markup=main_menu_keyboard())
         return
 
     c.execute("SELECT * FROM user_promocodes WHERE user_id = %s AND code = %s", (user_id, code))
@@ -2179,12 +2225,12 @@ async def process_promo_code(update, context, user_id, code):
 
     if already_used:
         conn.close()
-        await update.message.reply_text("❌ Вы уже активировали этот промокод!")
+        await update.message.reply_text("❌ Вы уже активировали этот промокод!", reply_markup=main_menu_keyboard())
         return
 
     if promo['current_uses'] >= promo['max_uses']:
         conn.close()
-        await update.message.reply_text("❌ У этого промокода закончились использования!")
+        await update.message.reply_text("❌ У этого промокода закончились использования!", reply_markup=main_menu_keyboard())
         return
 
     reward_msg = ""
@@ -2207,7 +2253,7 @@ async def process_promo_code(update, context, user_id, code):
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(f"🎉 **Промокод успешно активирован!**\nВы получили: {reward_msg}", parse_mode="Markdown")
+    await update.message.reply_text(f"🎉 **Промокод успешно активирован!**\nВы получили: {reward_msg}", reply_markup=main_menu_keyboard(), parse_mode="Markdown")
 
 async def admin_create_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🎟 **Введите текст нового промокода (например: `RPL2026`):**", parse_mode="Markdown")
@@ -3173,7 +3219,7 @@ async def cardmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "🏆 **ТОП-10 ИГРОКОВ ПО MMR:**\n\n"
     for i, u in enumerate(top, 1):
         name = u['first_name'] or u['username'] or "Игрок"
-        safe_name = name.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+        safe_name = name.replace("_", "\\_").replace("*", "\\*").replace("`", "\`").replace("[", "\\[")
         text += f"{i}. **{safe_name}** — `{u['mmr']} MMR`\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -3926,7 +3972,8 @@ async def minigames_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎮 Камень-Ножницы-Бумага", callback_data="play_rps")],
         [InlineKeyboardButton("🎰 Слоты", callback_data="play_slots")],
-        [InlineKeyboardButton("🎲 Кости", callback_data="play_dice")]
+        [InlineKeyboardButton("🎲 Кости", callback_data="play_dice")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main_inline")]
     ])
     await update.message.reply_text("🕹 **Выберите мини-игру:**", reply_markup=kb, parse_mode="Markdown")
 
@@ -4065,14 +4112,16 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🏒 **Дуэль Буллитов!** Выбери зону:", reply_markup=duel_shot_keyboard())
         return WAITING_DUEL_SHOT
     elif data == "play_rps":
-        await query.message.reply_text("🎮 **Камень - Ножницы - Бумага**\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown")
+        await query.message.reply_text("🎮 **Камень - Ножницы - Бумага**\nВведите ставку в RPLCoin (целое число):", reply_markup=cancel_keyboard(), parse_mode="Markdown")
         return WAITING_RPS_BET
     elif data == "play_slots":
-        await query.message.reply_text("🎰 **Игровые Слоты**\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown")
+        await query.message.reply_text("🎰 **Игровые Слоты**\nВведите ставку в RPLCoin (целое число):", reply_markup=cancel_keyboard(), parse_mode="Markdown")
         return WAITING_SLOTS_BET
     elif data == "play_dice":
-        await query.message.reply_text("🎲 **Игра в Кости**\nСначала бросает бот, затем бот бросает за вас!\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown")
+        await query.message.reply_text("🎲 **Игра в Кости**\nСначала бросает бот, затем бот бросает за вас!\nВведите ставку в RPLCoin (целое число):", reply_markup=cancel_keyboard(), parse_mode="Markdown")
         return WAITING_DICE_BET
+    elif data == "back_to_main_inline":
+        await query.message.edit_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
 
 async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
