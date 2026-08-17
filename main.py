@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import asyncio
 import random
@@ -39,6 +40,7 @@ if not DATABASE_URL:
 
 ADMIN_SESSION_MINUTES = 30
 
+# Цены быстрой продажи карточек системно
 SELL_PRICES = {
     "Редкая": 500,
     "Очень редкая": 1000,
@@ -48,13 +50,7 @@ SELL_PRICES = {
     "Секретная": 25000
 }
 
-MENU_BUTTONS = {
-    "🏠 Главное меню", "🃏 Бесплатная карта", "🎒 Инвентарь", "🛒 Торговая площадка",
-    "🏒 Состав и Профиль", "⚔️ Искать игру", "🛒 Магазин Паков", "🏆 Топ MMR",
-    "🤝 Трейд", "🎁 Промокод", "🎮 Мини-игры", "🎡 Колесо удачи", "🎁 Ежедневный бонус",
-    "⬅️ Назад", "Назад", "/start", "/cancel"
-}
-
+# Состояния ConversationHandler
 (
     WAITING_LOGIN,
     WAITING_PASSWORD,
@@ -65,6 +61,7 @@ MENU_BUTTONS = {
     WAITING_DUEL_SHOT,
     WAITING_GIF_GOAL,
     WAITING_GIF_SAVE,
+    # Карточки / Команды / Паки
     CARD_ADMIN_MENU,
     ADD_COLLECTION_NAME,
     ADD_TEAM_NAME,
@@ -88,18 +85,23 @@ MENU_BUTTONS = {
     GRANT_CARD_DATA,
     GIVE_MONEY_DATA,
     WAITING_VIEW_USER_INV,
+    # Стартовый набор (админка)
     FREEPACK_ADMIN_SELECT_CARDS,
+    # Промокоды
     ADD_PROMO_CODE,
     ADD_PROMO_TYPE,
     ADD_PROMO_VAL,
     ADD_PROMO_LIMIT,
     WAITING_PROMO_INPUT,
+    # Рынок и Трейд
     WAITING_TRADE_TARGET,
     WAITING_TRADE_MONEY,
     WAITING_MARKET_PRICE_INPUT,
+    # Мини-игры
     WAITING_RPS_BET,
     WAITING_SLOTS_BET,
     WAITING_DICE_BET,
+    # Админ выставление паков на время
     ADMIN_SHOP_PACK_SELECT,
     ADMIN_SHOP_PACK_HOURS,
 ) = range(46)
@@ -112,6 +114,7 @@ def init_db():
     conn = get_db()
     c = conn.cursor()
     
+    # Пользователи
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -124,13 +127,18 @@ def init_db():
             daily_streak INTEGER DEFAULT 0,
             last_wheel_spin TIMESTAMP,
             free_card_cooldown_reset_until TIMESTAMP,
-            freepack_claimed BOOLEAN DEFAULT FALSE,
-            custom_card_claimed BOOLEAN DEFAULT FALSE
+            freepack_claimed BOOLEAN DEFAULT FALSE
         )
     ''')
+    # На случай, если таблица users уже существует из старой версии бота —
+    # добираем недостающие столбцы, чтобы не падать при апдейте.
+    c.execute('''
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS free_card_cooldown_reset_until TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS freepack_claimed BOOLEAN DEFAULT FALSE
+    ''')
     
-    c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_card_claimed BOOLEAN DEFAULT FALSE;")
-    
+    # Существующие системы
     c.execute('''
         CREATE TABLE IF NOT EXISTS source_channels (
             id SERIAL PRIMARY KEY,
@@ -178,6 +186,7 @@ def init_db():
         )
     ''')
     
+    # Система Карточек и Команд
     c.execute('''
         CREATE TABLE IF NOT EXISTS collections (
             id SERIAL PRIMARY KEY,
@@ -224,6 +233,7 @@ def init_db():
         )
     ''')
     
+    # Паки и Магазин
     c.execute('''
         CREATE TABLE IF NOT EXISTS packs (
             id SERIAL PRIMARY KEY,
@@ -250,12 +260,14 @@ def init_db():
         )
     ''')
 
+    # Конфигурация стартового набора (admin configured freepack)
     c.execute('''
         CREATE TABLE IF NOT EXISTS freepack_config (
             card_id INTEGER PRIMARY KEY REFERENCES cards(id) ON DELETE CASCADE
         )
     ''')
 
+    # Промокоды
     c.execute('''
         CREATE TABLE IF NOT EXISTS promo_codes (
             code TEXT PRIMARY KEY,
@@ -274,6 +286,7 @@ def init_db():
         )
     ''')
 
+    # Торговая площадка (Рынок)
     c.execute('''
         CREATE TABLE IF NOT EXISTS market (
             id SERIAL PRIMARY KEY,
@@ -338,7 +351,7 @@ async def check_pm_registered(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     return False
 
-def choose_card_for_user(cursor, user_id, candidate_cards, strict_unowned=False):
+def choose_card_for_user(cursor, user_id, candidate_cards):
     if not candidate_cards:
         return None
 
@@ -356,10 +369,31 @@ def choose_card_for_user(cursor, user_id, candidate_cards, strict_unowned=False)
 
     if unowned_cards:
         return random.choice(unowned_cards)
-    elif strict_unowned:
-        return None
     else:
         return random.choice(candidate_cards)
+
+def choose_new_card_strict(cursor, user_id, candidate_cards):
+    """
+    В отличие от choose_card_for_user, НИКОГДА не возвращает карту,
+    которая уже есть у игрока (без дублей/стаков). Если среди
+    candidate_cards нет ни одной новой карты — возвращает None,
+    и вызывающий код должен решить, что делать дальше (расширить
+    пул кандидатов или выдать компенсацию).
+    """
+    if not candidate_cards:
+        return None
+
+    card_ids = tuple(c['id'] for c in candidate_cards)
+
+    if len(card_ids) == 1:
+        cursor.execute("SELECT card_id FROM user_cards WHERE user_id = %s AND card_id = %s AND count > 0", (user_id, card_ids[0]))
+    else:
+        cursor.execute("SELECT card_id FROM user_cards WHERE user_id = %s AND card_id IN %s AND count > 0", (user_id, card_ids))
+
+    owned_ids = set(r['card_id'] for r in cursor.fetchall())
+    unowned_cards = [c for c in candidate_cards if c['id'] not in owned_ids]
+
+    return random.choice(unowned_cards) if unowned_cards else None
 
 def get_config(key):
     conn = get_db()
@@ -494,9 +528,6 @@ def main_menu_keyboard():
         ["🎁 Ежедневный бонус"]
     ], resize_keyboard=True)
 
-def back_reply_keyboard():
-    return ReplyKeyboardMarkup([["⬅️ Назад"]], resize_keyboard=True)
-
 def admin_menu_keyboard():
     return ReplyKeyboardMarkup([
         ["➕ Добавить каналы", "➕ Добавить чаты"],
@@ -530,8 +561,7 @@ def duel_shot_keyboard():
         [InlineKeyboardButton("🥅 Левая девятка", callback_data="shot_left")],
         [InlineKeyboardButton("🥅 Правая девятка", callback_data="shot_right")],
         [InlineKeyboardButton("🧤 Домик (между щитков)", callback_data="shot_five")],
-        [InlineKeyboardButton("🥅 Низ в угол", callback_data="shot_low")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu_nav")]
+        [InlineKeyboardButton("🥅 Низ в угол", callback_data="shot_low")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -540,15 +570,6 @@ COUNTRIES = [
     "Slovakia", "Germany", "Switzerland", "Latvia", "Belarus", "Kazakhstan",
     "UK", "France", "Austria", "Norway", "Denmark", "Japan", "China"
 ]
-
-async def check_cancel_or_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not update.message or not update.message.text:
-        return False
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Возврат в меню.", reply_markup=main_menu_keyboard())
-        return True
-    return False
 
 # ---------- ЛОГИКА СТАРТОВОГО НАБОРА (/freepack) ----------
 async def grant_free_pack_to_user(user_id, context):
@@ -614,7 +635,7 @@ async def freepack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     get_or_create_user(user.id, user.username, user.first_name)
     success, msg = await grant_free_pack_to_user(user.id, context)
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def freepack_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -658,8 +679,7 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             minutes = rem // 60
             await update.message.reply_text(
                 f"⏳ Ежедневный бонус можно забирать раз в 24 часа!\nПодождите ещё: **{hours} ч {minutes} мин**\nВаш текущий стрик: **{streak} дней** 🔥",
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard()
+                parse_mode="Markdown"
             )
             return
         elif diff.total_seconds() > 172800:
@@ -713,8 +733,7 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🎁 **Ежедневный бонус за день {streak}/7 успешно получен!**\nВы получили: {reward_text}\n\nВозвращайтесь завтра за новым бонусом!",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
+        parse_mode="Markdown"
     )
 
 # ---------- КОЛЕСО УДАЧИ (/wheel) ----------
@@ -725,7 +744,7 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT balance, last_wheel_spin, custom_card_claimed FROM users WHERE user_id = %s", (user.id,))
+    c.execute("SELECT balance, last_wheel_spin FROM users WHERE user_id = %s", (user.id,))
     u_row = c.fetchone()
     conn.close()
 
@@ -733,7 +752,6 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     last_spin = u_row['last_wheel_spin']
-    custom_claimed = u_row['custom_card_claimed']
     now = datetime.now()
     if last_spin:
         if isinstance(last_spin, str):
@@ -743,16 +761,16 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rem = timedelta(seconds=129600) - diff
             hours, rem_sec = divmod(int(rem.total_seconds()), 3600)
             minutes = rem_sec // 60
-            await update.message.reply_text(f"⏳ Колесо удачи можно крутить раз в **36 часов**!\nПодождите ещё: **{hours} ч {minutes} мин**", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+            await update.message.reply_text(f"⏳ Колесо удачи можно крутить раз в **36 часов**!\nПодождите ещё: **{hours} ч {minutes} мин**", parse_mode="Markdown")
             return
 
     cost = 10000
     if u_row['balance'] < cost:
-        await update.message.reply_text(f"❌ Недостаточно средств! Прокрутка колеса стоит **{cost} RPLCoin**.", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await update.message.reply_text(f"❌ Недостаточно средств! Прокрутка колеса стоит **{cost} RPLCoin**.", parse_mode="Markdown")
         return
 
     msg = await update.message.reply_text("🎡 **Идет открытие колеса удачи...** ⏳", parse_mode="Markdown")
-    await asyncio.sleep(3)
+    await asyncio.sleep(5)
 
     try:
         await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
@@ -760,8 +778,9 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     prizes = ["reset_cd", "money", "card_50_65", "card_70_80", "card_80_85", "discount", "custom_card", "rare", "very_rare", "epic", "mythic", "nothing"]
-    
-    if custom_claimed:
+
+    # Приз "Создать карточку с рейтингом 82" может выпасть только 1 раз за всё время существования бота
+    if get_config("custom_card_prize_claimed") == "1":
         prizes = [p for p in prizes if p != "custom_card"]
 
     prize = random.choice(prizes)
@@ -812,8 +831,8 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disc = random.randint(1, 30)
         prize_text = f"🏷 **Скидка {disc}%** на любую покупку в магазине!"
     elif prize == "custom_card":
-        c.execute("UPDATE users SET custom_card_claimed = TRUE WHERE user_id = %s", (user.id,))
-        prize_text = "🎨 **Создание своей карты с рейтингом 82!** Свяжитесь с администратором для вызова и создания карточки! (Выпало 1 раз!)"
+        set_config("custom_card_prize_claimed", "1")
+        prize_text = "🎨 **Уникальный приз: создание своей карты с рейтингом 82!** Свяжитесь с администратором @admin для создания.\n\n⚠️ Это единственная карта такого рода — больше в колесе удачи она не выпадет никому."
     elif prize == "rare":
         c.execute("SELECT * FROM cards WHERE rarity = 'Редкая'")
         cds = c.fetchall()
@@ -862,27 +881,21 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🎡 **Колесо удачи прокручено!**\n\n{prize_text}",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
+        parse_mode="Markdown"
     )
 
 # ---------- МИНИ-ИГРА КАМЕНЬ-НОЖНИЦЫ-БУМАГА (/rps) ----------
 async def rps_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
-    await update.message.reply_text("🎮 **Камень - Ножницы - Бумага**\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+    await update.message.reply_text("🎮 **Камень - Ножницы - Бумага**\nВведите ставку в RPLCoin (целое число):", reply_markup=bet_cancel_keyboard(), parse_mode="Markdown")
     return WAITING_RPS_BET
 
 async def rps_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Возврат в главное меню.", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-
     try:
-        bet = int(text)
+        bet = int(update.message.text.strip())
         if bet <= 0:
-            await update.message.reply_text("❌ Ставка должна быть больше 0!", reply_markup=back_reply_keyboard())
+            await update.message.reply_text("❌ Ставка должна быть больше 0!", reply_markup=bet_cancel_keyboard())
             return WAITING_RPS_BET
 
         user = update.effective_user
@@ -893,7 +906,7 @@ async def rps_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
         if bet > u_bal:
-            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.", reply_markup=back_reply_keyboard())
+            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.", reply_markup=bet_cancel_keyboard())
             return WAITING_RPS_BET
 
         context.user_data["rps_bet"] = bet
@@ -901,12 +914,12 @@ async def rps_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🪨 Камень", callback_data="rps_rock"),
              InlineKeyboardButton("✂️ Ножницы", callback_data="rps_scissors"),
              InlineKeyboardButton("📄 Бумага", callback_data="rps_paper")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu_nav")]
+            [InlineKeyboardButton("🔙 Назад", callback_data="cancel_minigame")]
         ])
         await update.message.reply_text(f"✅ Ставка принята: **{bet} RPLCoin**.\nВыберите ваш ход:", reply_markup=kb, parse_mode="Markdown")
         return ConversationHandler.END
     except ValueError:
-        await update.message.reply_text("❌ Введите ставку числом или нажмите «⬅️ Назад»!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите ставку числом!", reply_markup=bet_cancel_keyboard())
         return WAITING_RPS_BET
 
 async def rps_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -931,13 +944,14 @@ async def rps_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.edit_text("❌ Ошибка: недостаточно средств для выплаты ставки.")
         return
 
+    # Защищенная логика шансов с псевдорандомом и смещением
     rand_val = random.random()
-    if rand_val < 0.40:
+    if rand_val < 0.42:
         if player_choice == "rock": bot_choice = "scissors"
         elif player_choice == "scissors": bot_choice = "paper"
         else: bot_choice = "rock"
         result = "win"
-    elif rand_val < 0.60:
+    elif rand_val < 0.58:
         bot_choice = player_choice
         result = "draw"
     else:
@@ -968,23 +982,18 @@ async def rps_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     await query.message.edit_text(text, parse_mode="Markdown")
 
-# ---------- МИНИ-ИГРА СЛОТЫ (Шанс выигрыша 25%) ----------
+# ---------- МИНИ-ИГРА СЛОТЫ ----------
 async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
-    await update.message.reply_text("🎰 **Игровые Слоты (Шанс на победу 25%)**\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+    await update.message.reply_text("🎰 **Игровые Слоты**\nВведите ставку в RPLCoin (целое число):", reply_markup=bet_cancel_keyboard(), parse_mode="Markdown")
     return WAITING_SLOTS_BET
 
 async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Возврат в главное меню.", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-
     try:
-        bet = int(text)
+        bet = int(update.message.text.strip())
         if bet <= 0:
-            await update.message.reply_text("❌ Ставка должна быть больше 0!", reply_markup=back_reply_keyboard())
+            await update.message.reply_text("❌ Ставка должна быть больше 0!", reply_markup=bet_cancel_keyboard())
             return WAITING_SLOTS_BET
 
         user = update.effective_user
@@ -995,7 +1004,7 @@ async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
         if bet > u_bal:
-            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.", reply_markup=back_reply_keyboard())
+            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.", reply_markup=bet_cancel_keyboard())
             return WAITING_SLOTS_BET
 
         conn = get_db()
@@ -1004,32 +1013,35 @@ async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
 
-        msg = await update.message.reply_text("🎰 | 🔄 | 🔄 | 🔄 |\nКрутим слоты...", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        msg = await update.message.reply_text("🎰 | 🔄 | 🔄 | 🔄 |\nКрутим слоты...", parse_mode="Markdown")
         await asyncio.sleep(2)
 
         symbols = ["🏒", "🥅", "⭐", "🍒", "7️⃣", "💎"]
-        
+
+        # Шансы слотов: суммарный шанс выигрыша ровно 25%
+        # 3% джекпот (x10) + 7% крупный приз (x5) + 15% малый приз (x2) = 25% побед, 75% проигрыш
         r = random.random()
-        if r < 0.25:
-            win_type = random.random()
-            if win_type < 0.15:
-                sym = random.choice(["7️⃣", "💎"])
-                line = [sym, sym, sym]
-                mult = 5
-            elif win_type < 0.50:
-                sym = random.choice(["⭐", "🏒", "🥅"])
-                line = [sym, sym, sym]
-                mult = 3
-            else:
-                sym = random.choice(symbols)
-                line = [sym, sym, random.choice([s for s in symbols if s != sym])]
-                mult = 2
+        if r < 0.03:
+            sym = random.choice(["7️⃣", "💎", "⭐"])
+            line = [sym, sym, sym]
+            mult = 10
+        elif r < 0.10:
+            sym = random.choice(symbols)
+            line = [sym, sym, sym]
+            mult = 5
+        elif r < 0.25:
+            sym = random.choice(symbols)
+            other = random.choice([s for s in symbols if s != sym])
+            line = [sym, sym, other]
+            random.shuffle(line)
+            mult = 2
         else:
+            # Гарантированный проигрыш: три РАЗНЫХ символа, чтобы не было случайных совпадений
+            while True:
+                line = random.choices(symbols, k=3)
+                if len(set(line)) == 3:
+                    break
             mult = 0
-            s1 = random.choice(symbols)
-            s2 = random.choice([s for s in symbols if s != s1])
-            s3 = random.choice([s for s in symbols if s != s1 and s != s2])
-            line = [s1, s2, s3]
 
         conn = get_db()
         c = conn.cursor()
@@ -1047,26 +1059,21 @@ async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     except ValueError:
-        await update.message.reply_text("❌ Введите ставку числом или нажмите «⬅️ Назад»!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите ставку числом!", reply_markup=bet_cancel_keyboard())
         return WAITING_SLOTS_BET
 
-# ---------- МИНИ-ИГРА КОСТИ (Шанс выигрыша 25%) ----------
+# ---------- МИНИ-ИГРА КОСТИ ----------
 async def dice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
-    await update.message.reply_text("🎲 **Игра в Кости (Шанс на победу 25%)**\nСначала бросает бот, затем бот бросает за вас!\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+    await update.message.reply_text("🎲 **Игра в Кости**\nСначала бросает бот, затем бот бросает за вас!\nВведите ставку в RPLCoin (целое число):", reply_markup=bet_cancel_keyboard(), parse_mode="Markdown")
     return WAITING_DICE_BET
 
 async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Возврат в главное меню.", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-
     try:
-        bet = int(text)
+        bet = int(update.message.text.strip())
         if bet <= 0:
-            await update.message.reply_text("❌ Ставка должна быть больше 0!", reply_markup=back_reply_keyboard())
+            await update.message.reply_text("❌ Ставка должна быть больше 0!", reply_markup=bet_cancel_keyboard())
             return WAITING_DICE_BET
 
         user = update.effective_user
@@ -1077,7 +1084,7 @@ async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
         if bet > u_bal:
-            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.", reply_markup=back_reply_keyboard())
+            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.", reply_markup=bet_cancel_keyboard())
             return WAITING_DICE_BET
 
         conn = get_db()
@@ -1086,15 +1093,16 @@ async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
 
-        msg = await update.message.reply_text("🎲 Бот готовится к броску...", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        msg = await update.message.reply_text("🎲 Бот готовится к броску...", parse_mode="Markdown")
         await asyncio.sleep(2)
 
+        # Шансы костей: победа ровно 25%, ничья 20%, поражение 55%
         r = random.random()
         if r < 0.25:
-            bot_val = random.randint(1, 5)
+            bot_val = random.randint(1, 4)
             player_val = random.randint(bot_val + 1, 6)
             res = "win"
-        elif r < 0.40:
+        elif r < 0.45:
             bot_val = random.randint(1, 6)
             player_val = bot_val
             res = "draw"
@@ -1104,7 +1112,7 @@ async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             res = "lose"
 
         await msg.edit_text(f"🤖 Бот бросает кости...\n🎲 Результат бота: **{bot_val}**", parse_mode="Markdown")
-        await asyncio.sleep(2)
+        await asyncio.sleep(2.5)
 
         conn = get_db()
         c = conn.cursor()
@@ -1128,7 +1136,7 @@ async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     except ValueError:
-        await update.message.reply_text("❌ Введите ставку числом или нажмите «⬅️ Назад»!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите ставку числом!", reply_markup=bet_cancel_keyboard())
         return WAITING_DICE_BET
 
 # ---------- ПРОФИЛЬ И СОСТАВ (/profile И /checkprofile) ----------
@@ -1138,7 +1146,7 @@ async def checkprofile_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     args = context.args
     if not args:
-        await update.message.reply_text("🔍 **Введите команду с указанием ID или username игрока:**\nПример: `/checkprofile @username` или `/checkprofile 123456789`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("🔍 **Введите команду с указанием ID или username игрока:**\nПример: `/checkprofile @username` или `/checkprofile 123456789`", parse_mode="Markdown")
         return
 
     target_str = args[0].replace("@", "")
@@ -1153,7 +1161,7 @@ async def checkprofile_command(update: Update, context: ContextTypes.DEFAULT_TYP
     target_user = c.fetchone()
     if not target_user:
         conn.close()
-        await update.message.reply_text("❌ Пользователь не найден в базе данных!", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("❌ Пользователь не найден в базе данных!")
         return
 
     target_id = target_user['user_id']
@@ -1221,12 +1229,12 @@ async def checkprofile_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💬 Написать в ЛС", url=f"https://t.me/{target_user['username']}" if target_user['username'] else f"tg://user?id={target_id}")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu_nav")]
+        [InlineKeyboardButton("🔙 Назад", callback_data="refresh_profile")]
     ])
 
     await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
 
-# ---------- ПОЛУЧЕНИЕ БЕСПЛАТНОЙ КАРТЫ (/rplcards) С ПРОВЕРКОЙ НА ПОВТОРЫ ----------
+# ---------- ПОЛУЧЕНИЕ БЕСПЛАТНОЙ КАРТЫ (/rplcards) ----------
 async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -1251,11 +1259,11 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             wait = (last_claim + timedelta(hours=8)) - now
             hours, rem = divmod(wait.seconds, 3600)
             minutes = rem // 60
-            await update.message.reply_text(f"⏳ Бесплатную карточку можно получать раз в **8 часов**!\nПодожди ещё: **{hours} ч {minutes} мин**", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+            await update.message.reply_text(f"⏳ Бесплатную карточку можно получать раз в **8 часов**!\nПодожди ещё: **{hours} ч {minutes} мин**", parse_mode="Markdown")
             return
 
     temp_msg = await update.message.reply_text("⏳ **Идет открытие карточки...**", parse_mode="Markdown")
-    await asyncio.sleep(2)
+    await asyncio.sleep(3)
 
     try:
         await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=temp_msg.message_id)
@@ -1269,7 +1277,6 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     c = conn.cursor()
-    
     c.execute('''
         SELECT c.*, col.name as collection_name, t.name as team_name, t.emoji as team_emoji
         FROM cards c
@@ -1291,12 +1298,14 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not cards:
         conn.close()
-        await update.message.reply_text("📭 В базе пока нет карточек! Администратор скоро их добавит.", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("📭 В базе пока нет карточек! Администратор скоро их добавит.")
         return
 
-    card = choose_card_for_user(c, user.id, cards, strict_unowned=True)
+    # Бесплатная карта никогда не должна дублировать уже имеющуюся у игрока карту
+    card = choose_new_card_strict(c, user.id, cards)
 
     if not card:
+        # В этой редкости у игрока уже есть все карты — расширяем пул на все редкости
         c.execute('''
             SELECT c.*, col.name as collection_name, t.name as team_name, t.emoji as team_emoji
             FROM cards c
@@ -1304,11 +1313,22 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             LEFT JOIN card_teams t ON c.team_id = t.id
             WHERE c.rarity != 'Секретная'
         ''')
-        all_cards = c.fetchall()
-        card = choose_card_for_user(c, user.id, all_cards, strict_unowned=True)
+        all_non_secret = c.fetchall()
+        card = choose_new_card_strict(c, user.id, all_non_secret)
 
     if not card:
-        card = random.choice(cards)
+        # У игрока уже есть абсолютно все доступные карточки — выдаём компенсацию, а не дубль
+        if bypassed:
+            c.execute("UPDATE users SET free_card_cooldown_reset_until = NULL, balance = balance + 3000 WHERE user_id = %s", (user.id,))
+        else:
+            c.execute("UPDATE users SET last_card_claim = %s, balance = balance + 3000 WHERE user_id = %s", (now, user.id))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(
+            "🎉 **Невероятно!** У вас уже есть все доступные карточки в игре, поэтому вместо дубликата вам начислено **3 000 RPLCoin**!",
+            parse_mode="Markdown"
+        )
+        return
 
     card_id = card['id']
 
@@ -1342,11 +1362,11 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if card['image_id']:
         try:
-            await update.message.reply_photo(photo=card['image_id'], caption=caption, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+            await update.message.reply_photo(photo=card['image_id'], caption=caption, parse_mode="Markdown")
             return
         except Exception:
             pass
-    await update.message.reply_text(caption, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    await update.message.reply_text(caption, parse_mode="Markdown")
 
 # ---------- ИНВЕНТАРЬ И КРАФТ (/inventory) ----------
 async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1404,7 +1424,6 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
         buttons.append([InlineKeyboardButton("💰 Продать карточки (системе)", callback_data="sell_menu")])
 
     buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="refresh_inv")])
-    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu_nav")])
     markup = InlineKeyboardMarkup(buttons)
 
     if query:
@@ -1445,7 +1464,7 @@ async def show_sell_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         btn_text = f"Продать {uc['nickname']} ({uc['ovr']} OVR) — {price} RPLCoin"
         buttons.append([InlineKeyboardButton(btn_text, callback_data=f"do_sell_{uc['id']}")])
 
-    buttons.append([InlineKeyboardButton("⬅️ Назад в инвентарь", callback_data="refresh_inv")])
+    buttons.append([InlineKeyboardButton("🔙 Назад в инвентарь", callback_data="refresh_inv")])
 
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
@@ -1600,7 +1619,6 @@ async def show_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if my_cnt > 0:
         nav_btns.append(InlineKeyboardButton(f"📦 Мои лоты ({my_cnt})", callback_data="my_market_items"))
     nav_btns.append(InlineKeyboardButton("🔄 Обновить", callback_data="refresh_market"))
-    nav_btns.append(InlineKeyboardButton("⬅️ Назад", callback_data="main_menu_nav"))
     
     buttons.append(nav_btns)
 
@@ -1641,7 +1659,7 @@ async def show_my_market_items(update: Update, context: ContextTypes.DEFAULT_TYP
             text += f"🏷 **#{item['market_id']}** | **{item['nickname']}** ({item['ovr']} OVR) — `{item['price']} RPLCoin`\n"
             buttons.append([InlineKeyboardButton(f"❌ Снять #{item['market_id']} ({item['nickname']})", callback_data=f"cancel_market_{item['market_id']}")])
 
-    buttons.append([InlineKeyboardButton("⬅️ Назад на рынок", callback_data="refresh_market")])
+    buttons.append([InlineKeyboardButton("🔙 Назад на рынок", callback_data="refresh_market")])
 
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
@@ -1670,7 +1688,7 @@ async def market_start_list_card(update: Update, context: ContextTypes.DEFAULT_T
     for uc in user_cards:
         buttons.append([InlineKeyboardButton(f"{uc['nickname']} ({uc['ovr']} OVR) - x{uc['count']}", callback_data=f"select_mcard_{uc['id']}")])
 
-    buttons.append([InlineKeyboardButton("⬅️ Назад в инвентарь", callback_data="refresh_inv")])
+    buttons.append([InlineKeyboardButton("🔙 Назад в инвентарь", callback_data="refresh_inv")])
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
 async def market_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1693,7 +1711,7 @@ async def market_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     elif data.startswith("select_mcard_"):
         card_id = int(data.split("_")[2])
         context.user_data["m_card_id"] = card_id
-        await query.message.reply_text("💲 **Введите цену продажи (в RPLCoin, максимум 999 999):**\nНапример: `1500`", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+        await query.message.reply_text("💲 **Введите цену продажи (в RPLCoin, максимум 999 999):**\nНапример: `1500`", parse_mode="Markdown")
         return WAITING_MARKET_PRICE_INPUT
 
     elif data.startswith("cancel_market_"):
@@ -1771,15 +1789,10 @@ async def market_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await show_market(update, context)
 
 async def execute_market_list_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Возврат в главное меню.", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-
     try:
-        price = int(text)
+        price = int(update.message.text.strip())
         if price <= 0 or price > 999999:
-            await update.message.reply_text("❌ Цена должна быть от 1 до 999 999 RPLCoin! Попробуйте снова:", reply_markup=back_reply_keyboard())
+            await update.message.reply_text("❌ Цена должна быть от 1 до 999 999 RPLCoin! Попробуйте снова:")
             return WAITING_MARKET_PRICE_INPUT
 
         card_id = context.user_data.get("m_card_id")
@@ -1793,7 +1806,7 @@ async def execute_market_list_price(update: Update, context: ContextTypes.DEFAUL
 
         if not row:
             conn.close()
-            await update.message.reply_text("❌ У вас больше нет этой карточки!", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("❌ У вас больше нет этой карточки!")
             return ConversationHandler.END
 
         c.execute("UPDATE user_cards SET count = count - 1 WHERE user_id = %s AND card_id = %s", (user.id, card_id))
@@ -1817,12 +1830,12 @@ async def execute_market_list_price(update: Update, context: ContextTypes.DEFAUL
         conn.commit()
         conn.close()
 
-        await update.message.reply_text(f"✅ **Карточка успешно выставлена за {price} RPLCoin на Торговую площадку!**", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await update.message.reply_text(f"✅ **Карточка успешно выставлена за {price} RPLCoin на Торговую площадку!**", parse_mode="Markdown")
         await show_market(update, context)
         return ConversationHandler.END
 
     except ValueError:
-        await update.message.reply_text("❌ Введите цену целым числом (до 999 999) или нажмите «⬅️ Назад»:", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите цену целым числом (до 999 999):")
         return WAITING_MARKET_PRICE_INPUT
 
 # ---------- СИСТЕМА ТРЕЙДА (/trade) ----------
@@ -1836,7 +1849,7 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
 
     if not args:
-        await update.message.reply_text("🤝 **Введи команду с указанием никнейма или ID:**\nПример: `/trade @username` или `/trade 123456789`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("🤝 **Введи команду с указанием никнейма или ID:**\nПример: `/trade @username` или `/trade 123456789`", parse_mode="Markdown")
         return
 
     target_str = args[0].replace("@", "")
@@ -1852,18 +1865,18 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not target_user:
-        await update.message.reply_text("❌ Игрок не найден в базе данных бота!", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("❌ Игрок не найден в базе данных бота!")
         return
 
     if target_user['user_id'] == user.id:
-        await update.message.reply_text("❌ Вы не можете отправить предложение трейда самому себе!", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("❌ Вы не можете отправить предложение трейда самому себе!")
         return
 
     target_id = target_user['user_id']
 
     for tid, tdata in active_trades.items():
         if user.id in (tdata['p1'], tdata['p2']) or target_id in (tdata['p1'], tdata['p2']):
-            await update.message.reply_text("❌ Один из игроков уже находится в активном трейде!", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("❌ Один из игроков уже находится в активном трейде!")
             return
 
     kb = InlineKeyboardMarkup([
@@ -1871,7 +1884,7 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ Отклонить", callback_data=f"decline_trade_{user.id}_{target_id}")]
     ])
 
-    await update.message.reply_text(f"🤝 Вы отправили предложение обмена игроку **{target_user['first_name']}**! Ожидание ответа...", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    await update.message.reply_text(f"🤝 Вы отправили предложение обмена игроку **{target_user['first_name']}**! Ожидание ответа...", parse_mode="Markdown")
 
     try:
         await context.bot.send_message(
@@ -2047,7 +2060,7 @@ async def trade_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         elif action == "addmoney":
             context.user_data["active_trade_id"] = trade_id
-            await query.message.reply_text("💵 **Введите сумму RPLCoin для трейда:**", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+            await query.message.reply_text("💵 **Введите сумму RPLCoin для трейда:**", parse_mode="Markdown")
             return WAITING_TRADE_MONEY
 
         elif action == "addcard":
@@ -2074,7 +2087,7 @@ async def trade_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 if uc['count'] - cnt_in_tr > 0:
                     buttons.append([InlineKeyboardButton(f"{uc['nickname']} ({uc['ovr']} OVR)", callback_data=f"tr_putcard_{trade_id}_{uc['card_id']}")])
 
-            buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"tr_back_{trade_id}")])
+            buttons.append([InlineKeyboardButton("🔙 Назад", callback_data=f"tr_back_{trade_id}")])
             await query.edit_message_text("📋 **Выберите карточку для добавления в предложении:**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
         elif action == "putcard":
@@ -2156,13 +2169,8 @@ async def execute_trade_finish(context, trade_id):
             pass
 
 async def execute_trade_money_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Трейд отменен / возврат в главное меню.", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-
     try:
-        val = int(text)
+        val = int(update.message.text.strip())
         if val < 0:
             val = 0
 
@@ -2170,7 +2178,7 @@ async def execute_trade_money_input(update: Update, context: ContextTypes.DEFAUL
         trade_id = context.user_data.get("active_trade_id")
 
         if not trade_id or trade_id not in active_trades:
-            await update.message.reply_text("❌ Трейд не активен!", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("❌ Трейд не активен!")
             return ConversationHandler.END
 
         tdata = active_trades[trade_id]
@@ -2181,7 +2189,7 @@ async def execute_trade_money_input(update: Update, context: ContextTypes.DEFAUL
         conn.close()
 
         if val > u_bal:
-            await update.message.reply_text(f"❌ У вас нет столько RPLCoin! Ваш баланс: {u_bal}", reply_markup=back_reply_keyboard())
+            await update.message.reply_text(f"❌ У вас нет столько RPLCoin! Ваш баланс: {u_bal}")
             return WAITING_TRADE_MONEY
 
         if user.id == tdata['p1']:
@@ -2192,12 +2200,12 @@ async def execute_trade_money_input(update: Update, context: ContextTypes.DEFAUL
         tdata['p1_ready'] = False
         tdata['p2_ready'] = False
 
-        await update.message.reply_text(f"✅ Установлена сумма {val} RPLCoin.", reply_markup=main_menu_keyboard())
+        await update.message.reply_text(f"✅ Установлена сумма {val} RPLCoin.")
         await update_trade_views(context, trade_id)
         return ConversationHandler.END
 
     except ValueError:
-        await update.message.reply_text("❌ Введите сумму целым числом или нажмите «⬅️ Назад»!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите сумму целым числом!")
         return WAITING_TRADE_MONEY
 
 # ---------- ПРОМОКОДЫ (/promo) ----------
@@ -2213,16 +2221,11 @@ async def promo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_promo_code(update, context, user.id, code)
         return
 
-    await update.message.reply_text("🎟 **Введите ваш промокод:**", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+    await update.message.reply_text("🎟 **Введите ваш промокод:**", parse_mode="Markdown")
     return WAITING_PROMO_INPUT
 
 async def promo_input_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Возврат в главное меню.", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-
-    code = text.upper()
+    code = update.message.text.strip().upper()
     user = update.effective_user
     await process_promo_code(update, context, user.id, code)
     return ConversationHandler.END
@@ -2236,7 +2239,7 @@ async def process_promo_code(update, context, user_id, code):
 
     if not promo:
         conn.close()
-        await update.message.reply_text("❌ Введен несуществующий или недействительный промокод!", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("❌ Введен несуществующий или недействительный промокод!")
         return
 
     c.execute("SELECT * FROM user_promocodes WHERE user_id = %s AND code = %s", (user_id, code))
@@ -2244,12 +2247,12 @@ async def process_promo_code(update, context, user_id, code):
 
     if already_used:
         conn.close()
-        await update.message.reply_text("❌ Вы уже активировали этот промокод!", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("❌ Вы уже активировали этот промокод!")
         return
 
     if promo['current_uses'] >= promo['max_uses']:
         conn.close()
-        await update.message.reply_text("❌ У этого промокода закончились использования!", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("❌ У этого промокода закончились использования!")
         return
 
     reward_msg = ""
@@ -2272,62 +2275,43 @@ async def process_promo_code(update, context, user_id, code):
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(f"🎉 **Промокод успешно активирован!**\nВы получили: {reward_msg}", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    await update.message.reply_text(f"🎉 **Промокод успешно активирован!**\nВы получили: {reward_msg}", parse_mode="Markdown")
 
 async def admin_create_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎟 **Введите текст нового промокода (например: `RPL2026`):**", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+    await update.message.reply_text("🎟 **Введите текст нового промокода (например: `RPL2026`):**", parse_mode="Markdown")
     return ADD_PROMO_CODE
 
 async def admin_promo_set_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Отмена создания промокода.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
-    context.user_data["p_code"] = text.upper()
-    kb = [["💰 Деньги", "🃏 Карточка"], ["⬅️ Назад"]]
+    context.user_data["p_code"] = update.message.text.strip().upper()
+    kb = [["💰 Деньги", "🃏 Карточка"]]
     await update.message.reply_text("🎁 Выберите тип награды:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return ADD_PROMO_TYPE
 
 async def admin_promo_set_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t_text = update.message.text.strip()
-    if t_text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Отмена создания промокода.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     r_type = "money" if "Деньги" in t_text else "card"
     context.user_data["p_reward_type"] = r_type
 
     if r_type == "money":
-        await update.message.reply_text("💰 Введите количество денег (RPLCoin):", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("💰 Введите количество денег (RPLCoin):", reply_markup=ReplyKeyboardRemove())
     else:
-        await update.message.reply_text("🃏 Введите ID выдаваемой карточки:", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("🃏 Введите ID выдаваемой карточки:", reply_markup=ReplyKeyboardRemove())
 
     return ADD_PROMO_VAL
 
 async def admin_promo_set_val(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Отмена создания промокода.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     try:
-        val = int(text)
+        val = int(update.message.text.strip())
         context.user_data["p_reward_val"] = val
-        await update.message.reply_text("🔢 Введите общее количество активаций (лимит использования):", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("🔢 Введите общее количество активаций (лимит использования):")
         return ADD_PROMO_LIMIT
     except ValueError:
-        await update.message.reply_text("❌ Введите число!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите число!")
         return ADD_PROMO_VAL
 
 async def admin_promo_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Отмена создания промокода.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     try:
-        limit = int(text)
+        limit = int(update.message.text.strip())
         code = context.user_data.get("p_code")
         r_type = context.user_data.get("p_reward_type")
         r_val = context.user_data.get("p_reward_val")
@@ -2346,7 +2330,7 @@ async def admin_promo_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CARD_ADMIN_MENU
 
     except ValueError:
-        await update.message.reply_text("❌ Введите число!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите число!")
         return ADD_PROMO_LIMIT
 
 # ---------- ПРОФИЛЬ И СОСТАВ (/profile) ----------
@@ -2429,8 +2413,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Изменить Состав", callback_data="edit_roster_menu")],
-        [InlineKeyboardButton("🔄 Обновить", callback_data="refresh_profile")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu_nav")]
+        [InlineKeyboardButton("🔄 Обновить", callback_data="refresh_profile")]
     ])
 
     if query:
@@ -2461,7 +2444,7 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
             [InlineKeyboardButton("🏒 Выбрать Полевого 2", callback_data="set_pos_skater2")],
             [InlineKeyboardButton("🏒 Выбрать Полевого 3", callback_data="set_pos_skater3")],
             [InlineKeyboardButton("🏒 Выбрать Полевого 4", callback_data="set_pos_skater4")],
-            [InlineKeyboardButton("⬅️ Назад в профиль", callback_data="refresh_profile")]
+            [InlineKeyboardButton("🔙 Назад в профиль", callback_data="refresh_profile")]
         ])
         await query.edit_message_text("⚙️ **Выберите позицию для изменения:**", reply_markup=kb, parse_mode="Markdown")
 
@@ -2492,7 +2475,7 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
             t_str = f"({card['emoji'] or '🏒'} {card['team_name']})" if card['team_name'] else ""
             buttons.append([InlineKeyboardButton(f"{card['nickname']} - {card['ovr']} OVR {t_str}", callback_data=f"apply_card_{pos_type}_{card['id']}")])
         
-        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="edit_roster_menu")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="edit_roster_menu")])
         await query.edit_message_text(f"📋 **Выберите карточку для {pos_type.capitalize()}:**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("apply_card_"):
@@ -2524,7 +2507,7 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await query.answer("✅ Карточка успешно установлена!")
         await show_profile(update, context)
 
-# ---------- МАТЧИ И ПОИСК СОПЕРНИКА (/cardmatch) ----------
+# ---------- МАТЧИ И ПОИСК СОПЕРНИКА (/cardmatch) С КНОПКОЙ ПОЛУЧЕНИЯ СТАРТОВОГО НАБОРА ----------
 active_searches = {}
 active_games = set()
 
@@ -2581,7 +2564,7 @@ async def cardmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u_data = get_or_create_user(user.id, user.username, user.first_name)
 
     if user.id in active_searches or user.id in active_games:
-        await update.message.reply_text("🔎 Вы уже находитесь в поиске или играете матч!", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("🔎 Вы уже находитесь в поиске или играете матч!")
         return
 
     conn = get_db()
@@ -2592,8 +2575,7 @@ async def cardmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not roster or not (roster['goalie_id'] and roster['skater1_id'] and roster['skater2_id'] and roster['skater3_id'] and roster['skater4_id']):
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎁 Получить стартовый набор карточек", callback_data="claim_freepack_btn")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu_nav")]
+            [InlineKeyboardButton("🎁 Получить стартовый набор карточек", callback_data="claim_freepack_btn")]
         ])
         await update.message.reply_text(
             "❌ **Вы не можете играть!** У вас полностью не собран состав (нужен 1 Вратарь + 4 Полевых).\n"
@@ -2791,7 +2773,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
         )
 
         await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}⏱ **1-й Период стартует! Команды выходят на лед...**")
-        await asyncio.sleep(3)
+        await asyncio.sleep(4)
 
         score1, score2 = 0, 0
         all_events = []
@@ -2863,7 +2845,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     f"📝 **Ход матча:**\n{recent_events}"
                 )
                 await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, status_text)
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(3.5)
 
         conn_g.close()
         await asyncio.sleep(2)
@@ -2875,7 +2857,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
             evt_ot_start = "⏳ **ОСНОВНОЕ ВРЕМЯ ЗАВЕРШЕНО СО СЧЕТОМ " + f"{score1}:{score2}! Начинается ОВЕРТАЙМ (5 минут, 3х3)!**"
             all_events.append(evt_ot_start)
             await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🔵\n\n{evt_ot_start}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(4)
 
             ot_prob1 = prob_p1 * 0.8
             ot_prob2 = prob_p2 * 0.8
@@ -2911,7 +2893,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     f"📝 **Ход матча:**\n{recent_events}"
                 )
                 await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, status_text)
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(3.5)
             conn_ot.close()
 
         await asyncio.sleep(2)
@@ -2923,7 +2905,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
             evt_so_start = "🏒 **СЕРИЯ ПОСЛЕМАТЧЕВЫХ БУЛЛИТОВ!**"
             all_events.append(evt_so_start)
             await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🔵\n\n{evt_so_start}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(4)
 
             so_score1 = 0
             so_score2 = 0
@@ -2956,7 +2938,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                 all_events.append(evt2)
                 recent_events = "\n".join(all_events[-6:])
                 await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n🎯 **СЕРИЯ БУЛЛИТОВ (Раунд {round_num}/3)**\n📊 Счет: 🔴 {score1} — {score2} 🔵\n\n{recent_events}")
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(3)
             conn_so.close()
 
         await asyncio.sleep(2)
@@ -3055,7 +3037,7 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
         )
 
         await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}⏱ **1-й Период стартует! Команды выходят на лед...**")
-        await asyncio.sleep(3)
+        await asyncio.sleep(4)
 
         score1, score2 = 0, 0
         all_events = []
@@ -3110,7 +3092,7 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
                     f"📝 **Ход матча:**\n{recent_events}"
                 )
                 await broadcast_match_text(context, chat_id, msg_id, None, None, status_text)
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(3.5)
 
         conn_ai.close()
         await asyncio.sleep(2)
@@ -3122,7 +3104,7 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
             evt_ot_start = "⏳ **ОСНОВНОЕ ВРЕМЯ ЗАВЕРШЕНО СО СЧЕТОМ " + f"{score1}:{score2}! Начинается ОВЕРТАЙМ (5 минут, 3х3)!**"
             all_events.append(evt_ot_start)
             await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🤖\n\n{evt_ot_start}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(4)
 
             ot_prob1 = prob_p1 * 0.8
             ot_prob2 = prob_ai * 0.8
@@ -3150,7 +3132,7 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
 
                 recent_events = "\n".join(all_events[-6:])
                 await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🤖\n⏱ **ОВЕРТАЙМ**\n\n{recent_events}")
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(3.5)
             conn_ot_ai.close()
 
         if score1 == score2:
@@ -3160,7 +3142,7 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
             evt_so_start = "🏒 **СЕРИЯ ПОСЛЕМАТЧЕВЫХ БУЛЛИТОВ ПРОТИВ ИИ БОТА!**"
             all_events.append(evt_so_start)
             await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n\n{evt_so_start}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(4)
 
             so_score1, so_score2 = 0, 0
             for round_num in range(1, 4):
@@ -3188,7 +3170,7 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
 
                 recent_events = "\n".join(all_events[-6:])
                 await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n🎯 **СЕРИЯ БУЛЛИТОВ**\n📊 Счет: 🔴 {score1} — {score2} 🤖\n\n{recent_events}")
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(3)
             conn_so_ai.close()
 
         await asyncio.sleep(2)
@@ -3253,7 +3235,7 @@ async def cardmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not top:
-        await update.message.reply_text("🏆 **ТОП-10 ИГРОКОВ ПО MMR:**\n\nПока нет зарегистрированных игроков.", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("🏆 **ТОП-10 ИГРОКОВ ПО MMR:**\n\nПока нет зарегистрированных игроков.", parse_mode="Markdown")
         return
 
     text = "🏆 **ТОП-10 ИГРОКОВ ПО MMR:**\n\n"
@@ -3262,9 +3244,9 @@ async def cardmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         safe_name = name.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
         text += f"{i}. **{safe_name}** — `{u['mmr']} MMR`\n"
 
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-# ---------- МАГАЗИН И ПАКИ ----------
+# ---------- МАГАЗИН И ПАКГИ С ОГРАНИЧЕНИЕМ ПО ВРЕМЕНИ ИЗ АДМИНКИ ----------
 async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -3290,7 +3272,7 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
             await query.message.edit_text(text)
         else:
-            await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+            await update.message.reply_text(text)
         return
 
     text = "🛒 **МАГАЗИН ПАКОВ КАРТОЧЕК:**\n\nВыберите пак для предварительного просмотра и покупки:\n\n"
@@ -3311,7 +3293,6 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"📦 **{p['name']}** — `{p['price']} RPLCoin` (Куплено: {lim_str}){time_left}\n"
         buttons.append([InlineKeyboardButton(f"📦 {p['name']} ({p['price']} RPLCoin)", callback_data=f"preview_pack_{p['id']}")])
 
-    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu_nav")])
     conn.close()
 
     markup = InlineKeyboardMarkup(buttons)
@@ -3374,7 +3355,7 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Подтвердить покупку", callback_data=f"confirm_pack_{pack_id}")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="cancel_pack_buy")]
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_pack_buy")]
         ])
 
         await query.answer()
@@ -3457,7 +3438,7 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("🎉 Пак успешно приобретен!", show_alert=True)
 
         temp_msg = await context.bot.send_message(chat_id=user.id, text="⏳ **Идет открытие пака...**", parse_mode="Markdown")
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
         try:
             await context.bot.delete_message(chat_id=user.id, message_id=temp_msg.message_id)
@@ -3494,21 +3475,15 @@ async def admin_freepack_setup_start(update: Update, context: ContextTypes.DEFAU
         "📦 **Настройка стартового набора:**\n"
         "Введите ID карточек через пробел, которые будут выдаваться новым игрокам при получении стартового набора (желательно 1 Вратарь + 4 Полевых):\n"
         "Пример: `1 2 3 4 5`",
-        parse_mode="Markdown",
-        reply_markup=back_reply_keyboard()
+        parse_mode="Markdown"
     )
     return FREEPACK_ADMIN_SELECT_CARDS
 
 async def admin_freepack_setup_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в настройки карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     try:
-        card_ids = [int(x) for x in text.split()]
+        card_ids = [int(x) for x in update.message.text.strip().split()]
         if not card_ids:
-            await update.message.reply_text("❌ Введите хотя бы один ID карточки!", reply_markup=back_reply_keyboard())
+            await update.message.reply_text("❌ Введите хотя бы один ID карточки!")
             return FREEPACK_ADMIN_SELECT_CARDS
 
         conn = get_db()
@@ -3522,7 +3497,7 @@ async def admin_freepack_setup_receive(update: Update, context: ContextTypes.DEF
         await update.message.reply_text(f"✅ Стартовый набор успешно обновлен! Содержит карточки ID: {card_ids}", reply_markup=card_admin_keyboard())
         return CARD_ADMIN_MENU
     except ValueError:
-        await update.message.reply_text("❌ Введите ID карточек числами через пробел!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите ID карточек числами через пробел!")
         return FREEPACK_ADMIN_SELECT_CARDS
 
 # ---------- АДМИНКАТОР И ВЫСТАВЛЕНИЕ ПАКОВ НА ВРЕМЯ ----------
@@ -3538,30 +3513,20 @@ async def admin_set_pack_time_start(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
 
     buttons = [[InlineKeyboardButton(p['name'], callback_data=f"adm_pack_{p['id']}")] for p in packs]
-    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_nav_back")])
     await update.message.reply_text("📦 Выберите пак, который хотите выставить на определенные часы:", reply_markup=InlineKeyboardMarkup(buttons))
     return ADMIN_SHOP_PACK_SELECT
 
 async def admin_shop_pack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "admin_nav_back":
-        await query.message.reply_text("⚙️ Админ-панель:", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
-
     pack_id = int(query.data.split("_")[2])
     context.user_data["admin_pack_id"] = pack_id
-    await query.message.reply_text("⏳ Введите количество часов, на которые пак будет выставлен в магазин (например: `24` или `48`):", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+    await query.message.reply_text("⏳ Введите количество часов, на которые пак будет выставлен в магазин (например: `24` или `48`):", parse_mode="Markdown")
     return ADMIN_SHOP_PACK_HOURS
 
 async def admin_shop_pack_hours_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в админ-меню.", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
-
     try:
-        hours = int(text)
+        hours = int(update.message.text.strip())
         pack_id = context.user_data.get("admin_pack_id")
         until_time = datetime.now() + timedelta(hours=hours)
 
@@ -3574,7 +3539,7 @@ async def admin_shop_pack_hours_receive(update: Update, context: ContextTypes.DE
         await update.message.reply_text(f"✅ Пак успешно выставлен в магазин на **{hours} часов** (доступен до {until_time.strftime('%Y-%m-%d %H:%M')})!", reply_markup=admin_menu_keyboard(), parse_mode="Markdown")
         return ConversationHandler.END
     except ValueError:
-        await update.message.reply_text("❌ Введите количество часов целым числом!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите количество часов целым числом!")
         return ADMIN_SHOP_PACK_HOURS
 
 # ---------- АДМИН-ПАНЕЛЬ КАРТОЧЕК И ПАКОВ ----------
@@ -3582,11 +3547,11 @@ async def admin_card_menu_handler(update: Update, context: ContextTypes.DEFAULT_
     text = update.message.text
 
     if text == "📁 Создать коллекцию":
-        await update.message.reply_text("📁 Введите название для новой коллекции:", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("📁 Введите название для новой коллекции:")
         return ADD_COLLECTION_NAME
 
     elif text == "🛡 Создать команду":
-        await update.message.reply_text("🛡 Введите название новой команды (например: `Ак Барс (Казань)`):", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("🛡 Введите название новой команды (например: `Ак Барс (Казань)`):", parse_mode="Markdown")
         return ADD_TEAM_NAME
 
     elif text == "❌ Удалить команду":
@@ -3601,88 +3566,69 @@ async def admin_card_menu_handler(update: Update, context: ContextTypes.DEFAULT_
             return CARD_ADMIN_MENU
 
         buttons = [[InlineKeyboardButton(f"{t['emoji']} {t['name']}", callback_data=f"del_team_{t['id']}")] for t in teams]
-        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_card_back")])
         await update.message.reply_text("Выберите команду для удаления:", reply_markup=InlineKeyboardMarkup(buttons))
         return DEL_TEAM_SELECT
 
     elif text == "🃏 Добавить карточку":
-        kb = [["Редкая", "Очень редкая"], ["Эпическая", "Мифическая"], ["Легендарная", "Секретная"], ["⬅️ Назад"]]
+        kb = [["Редкая", "Очень редкая"], ["Эпическая", "Мифическая"], ["Легендарная", "Секретная"]]
         await update.message.reply_text("✨ Выберите редкость карточки:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
         return ADD_CARD_RARITY
 
     elif text == "❌ Удалить карточку":
-        await update.message.reply_text("❌ Введите ID карточки для удаления:", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите ID карточки для удаления:")
         return DEL_CARD_ID
 
     elif text == "📦 Добавить пак":
-        await update.message.reply_text("📦 Введите название пака:", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("📦 Введите название пака:")
         return ADD_PACK_NAME
 
     elif text == "📦 Настроить стартовый набор":
         return await admin_freepack_setup_start(update, context)
 
     elif text == "🎁 Выдать карточку игроку":
-        await update.message.reply_text("🎁 Введите ID/@username пользователя и ID карточки через пробел (например: `@username 5` или `123456789 5`):", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("🎁 Введите ID/@username пользователя и ID карточки через пробел (например: `@username 5` или `123456789 5`):", parse_mode="Markdown")
         return GRANT_CARD_DATA
 
     elif text == "💰 Выдать деньги":
-        await update.message.reply_text("💰 Введите @username пользователя и сумму через пробел (например: `@username 5000`):", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("💰 Введите @username пользователя и сумму через пробел (например: `@username 5000`):", parse_mode="Markdown")
         return GIVE_MONEY_DATA
 
     elif text == "🎟 Создать промокод":
         await admin_create_promo_start(update, context)
         return ADD_PROMO_CODE
 
-    elif text in ("⬅️ Выйти из настройки карточек", "⬅️ Назад", "Назад"):
+    elif text == "⬅️ Выйти из настройки карточек":
         await update.message.reply_text("⚙️ Админ-панель:", reply_markup=admin_menu_keyboard())
         return ConversationHandler.END
 
     return CARD_ADMIN_MENU
 
 async def save_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
+    name = update.message.text.strip()
     conn = get_db()
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO collections (name) VALUES (%s)", (text,))
+        c.execute("INSERT INTO collections (name) VALUES (%s)", (name,))
         conn.commit()
-        await update.message.reply_text(f"✅ Коллекция **{text}** создана!", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Коллекция **{name}** создана!", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
     except Exception:
         await update.message.reply_text("❌ Ошибка! Коллекция с таким именем уже существует.", reply_markup=card_admin_keyboard())
     conn.close()
     return CARD_ADMIN_MENU
 
 async def save_team_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
-    context.user_data["team_name"] = text
-    await update.message.reply_text("🏒 Введите один эмодзи/смайлик для команды (например 🟢 или 🏒):", reply_markup=back_reply_keyboard())
+    context.user_data["team_name"] = update.message.text.strip()
+    await update.message.reply_text("🏒 Введите один эмодзи/смайлик для команды (например 🟢 или 🏒):")
     return ADD_TEAM_EMOJI
 
 async def save_team_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
-    context.user_data["team_emoji"] = text
-    await update.message.reply_text("🖼 Отправьте логотип/фото графику команды (или введите `-` чтобы пропустить):", reply_markup=back_reply_keyboard())
+    context.user_data["team_emoji"] = update.message.text.strip()
+    await update.message.reply_text("🖼 Отправьте логотип/фото графику команды (или введите `-` чтобы пропустить):")
     return ADD_TEAM_PHOTO
 
 async def save_team_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.text and update.message.text.strip() in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     photo_id = None
-    if update.message and update.message.photo:
+    if update.message.photo:
         photo_id = update.message.photo[-1].file_id
 
     name = context.user_data.get("team_name")
@@ -3702,11 +3648,6 @@ async def save_team_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def delete_team_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    if query.data == "admin_card_back":
-        await query.message.reply_text("⚙️ Меню управления карточками:", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     team_id = int(query.data.split("_")[2])
 
     conn = get_db()
@@ -3716,16 +3657,10 @@ async def delete_team_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     conn.close()
 
     await query.edit_message_text("✅ Команда удалена!")
-    await query.message.reply_text("⚙️ Меню управления карточками:", reply_markup=card_admin_keyboard())
     return CARD_ADMIN_MENU
 
 async def card_set_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
-    context.user_data["c_rarity"] = text
+    context.user_data["c_rarity"] = update.message.text.strip()
     
     conn = get_db()
     c = conn.cursor()
@@ -3738,41 +3673,24 @@ async def card_set_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CARD_ADMIN_MENU
 
     buttons = [[c_row['name']] for c_row in cols]
-    buttons.append(["⬅️ Назад"])
     await update.message.reply_text("📁 Выберите коллекцию:", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True))
     return ADD_CARD_COLLECTION
 
 async def card_set_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
-    context.user_data["c_collection"] = text
+    context.user_data["c_collection"] = update.message.text.strip()
     
     kb = [COUNTRIES[i:i+3] for i in range(0, len(COUNTRIES), 3)]
-    kb.append(["⬅️ Назад"])
     await update.message.reply_text("🌍 Выберите страну игрока:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return ADD_CARD_COUNTRY
 
 async def card_set_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
-    context.user_data["c_country"] = text
-    kb = [["Skater", "Goalie"], ["⬅️ Назад"]]
+    context.user_data["c_country"] = update.message.text.strip()
+    kb = [["Skater", "Goalie"]]
     await update.message.reply_text("🏒 Выберите позицию:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return ADD_CARD_POSITION
 
 async def card_set_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
-    context.user_data["c_position"] = text
+    context.user_data["c_position"] = update.message.text.strip()
     
     conn = get_db()
     c = conn.cursor()
@@ -3782,51 +3700,33 @@ async def card_set_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buttons = [[f"{t['emoji']} {t['name']}"] for t in teams]
     buttons.append(["Без команды"])
-    buttons.append(["⬅️ Назад"])
 
     await update.message.reply_text("🛡 Выберите команду игрока:", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True))
     return ADD_CARD_TEAM
 
 async def card_set_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t_text = update.message.text.strip()
-    if t_text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     context.user_data["c_team"] = t_text
-    await update.message.reply_text("🏷 Введите NickName игрока и номер (например: `miulio #11`):", reply_markup=back_reply_keyboard(), parse_mode="Markdown")
+
+    await update.message.reply_text("🏷 Введите NickName игрока и номер (например: `miulio #11`):", reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
     return ADD_CARD_NICK
 
 async def card_set_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
-    context.user_data["c_nick"] = text
-    await update.message.reply_text("⭐ Введите рейтинг OVR (число от 50 до 99):", reply_markup=back_reply_keyboard())
+    context.user_data["c_nick"] = update.message.text.strip()
+    await update.message.reply_text("⭐ Введите рейтинг OVR (число от 50 до 99):")
     return ADD_CARD_OVR
 
 async def card_set_ovr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     try:
-        ovr = int(text)
+        ovr = int(update.message.text.strip())
         context.user_data["c_ovr"] = ovr
-        await update.message.reply_text("🖼 Отправьте фотографию или GIF карточки:", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("🖼 Отправьте фотографию или GIF карточки:")
         return ADD_CARD_PHOTO
     except ValueError:
-        await update.message.reply_text("❌ Введите OVR числом!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите OVR числом!")
         return ADD_CARD_OVR
 
 async def card_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.text and update.message.text.strip() in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     photo_id = None
     if update.message.photo:
         photo_id = update.message.photo[-1].file_id
@@ -3868,13 +3768,8 @@ async def card_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CARD_ADMIN_MENU
 
 async def delete_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     try:
-        card_id = int(text)
+        card_id = int(update.message.text.strip())
         conn = get_db()
         c = conn.cursor()
         c.execute("DELETE FROM cards WHERE id = %s", (card_id,))
@@ -3886,68 +3781,44 @@ async def delete_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE
     return CARD_ADMIN_MENU
 
 async def pack_set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
-    context.user_data["p_name"] = text
-    await update.message.reply_text("💰 Введите цену пака в RPLCoin:", reply_markup=back_reply_keyboard())
+    context.user_data["p_name"] = update.message.text.strip()
+    await update.message.reply_text("💰 Введите цену пака в RPLCoin:")
     return ADD_PACK_PRICE
 
 async def pack_set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     try:
-        price = int(text)
+        price = int(update.message.text.strip())
         context.user_data["p_price"] = price
-        await update.message.reply_text("🔢 Введите лимит покупок пака на одного игрока (0 = безлимит):", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("🔢 Введите лимит покупок пака на одного игрока (0 = безлимит):")
         return ADD_PACK_LIMIT
     except ValueError:
-        await update.message.reply_text("❌ Введите цену числом!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите цену числом!")
         return ADD_PACK_PRICE
 
 async def pack_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     try:
-        lim = int(text)
+        lim = int(update.message.text.strip())
         context.user_data["p_limit"] = lim
-        await update.message.reply_text("🆔 Введите ID карточек для этого пака через пробел (до 10 ID):\nПример: `1 2 5 12`", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("🆔 Введите ID карточек для этого пака через пробел (до 10 ID):\nПример: `1 2 5 12`", parse_mode="Markdown")
         return ADD_PACK_CARDS
     except ValueError:
-        await update.message.reply_text("❌ Введите лимит числом!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите лимит числом!")
         return ADD_PACK_LIMIT
 
 async def pack_set_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     try:
-        card_ids = [int(x) for x in text.split()]
+        card_ids = [int(x) for x in update.message.text.strip().split()]
         if len(card_ids) > 10:
-            await update.message.reply_text("❌ В паке не может быть более 10 карточек!", reply_markup=back_reply_keyboard())
+            await update.message.reply_text("❌ В паке не может быть более 10 карточек!")
             return ADD_PACK_CARDS
         context.user_data["p_cards"] = card_ids
-        await update.message.reply_text("🖼 Отправьте фото/анимацию для обложки пака:", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("🖼 Отправьте фото/анимацию для обложки пака:")
         return ADD_PACK_PHOTO
     except ValueError:
-        await update.message.reply_text("❌ Введите ID карточек через пробел!", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("❌ Введите ID карточек через пробел!")
         return ADD_PACK_CARDS
 
 async def pack_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.text and update.message.text.strip() in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     photo_id = None
     if update.message.photo:
         photo_id = update.message.photo[-1].file_id
@@ -3973,13 +3844,8 @@ async def pack_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CARD_ADMIN_MENU
 
 async def grant_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     try:
-        parts = text.split()
+        parts = update.message.text.strip().split()
         user_input = parts[0].replace("@", "")
         card_id = int(parts[1])
 
@@ -4007,13 +3873,8 @@ async def grant_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return CARD_ADMIN_MENU
 
 async def give_money_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в меню карточек.", reply_markup=card_admin_keyboard())
-        return CARD_ADMIN_MENU
-
     try:
-        parts = text.split()
+        parts = update.message.text.strip().split()
         username = parts[0].replace("@", "")
         amount = int(parts[1])
 
@@ -4034,10 +3895,6 @@ async def give_money_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def admin_view_inventory_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = update.message.text.strip().replace("@", "")
-    if user_input in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в админ-меню.", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
-
     conn = get_db()
     c = conn.cursor()
 
@@ -4138,7 +3995,7 @@ async def minigames_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎮 Камень-Ножницы-Бумага", callback_data="play_rps")],
         [InlineKeyboardButton("🎰 Слоты", callback_data="play_slots")],
         [InlineKeyboardButton("🎲 Кости", callback_data="play_dice")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu_nav")]
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main_inline")]
     ])
     await update.message.reply_text("🕹 **Выберите мини-игру:**", reply_markup=kb, parse_mode="Markdown")
 
@@ -4149,34 +4006,24 @@ async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id):
         await update.message.reply_text("Вы уже авторизованы.", reply_markup=admin_menu_keyboard())
         return ConversationHandler.END
-    await update.message.reply_text("🔑 Введите логин:", reply_markup=back_reply_keyboard())
+    await update.message.reply_text("🔑 Введите логин:")
     return WAITING_LOGIN
 
 async def wait_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Отмена авторизации.", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-
-    context.user_data["login"] = text
-    await update.message.reply_text("🔒 Введите пароль:", reply_markup=back_reply_keyboard())
+    context.user_data["login"] = update.message.text
+    await update.message.reply_text("🔒 Введите пароль:")
     return WAITING_PASSWORD
 
 async def wait_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Отмена авторизации.", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-
     login = context.user_data.get("login")
-    password = text
+    password = update.message.text
     if check_credentials(login, password):
         add_admin(update.effective_user.id)
         context.user_data.clear()
         await update.message.reply_text("✅ Авторизован!", reply_markup=admin_menu_keyboard())
         return ConversationHandler.END
     else:
-        await update.message.reply_text("❌ Неверный логин или пароль!", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("❌ Неверный логин или пароль!")
         return ConversationHandler.END
 
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4188,10 +4035,10 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if text == "➕ Добавить каналы":
-        await update.message.reply_text("Введите @username канала (бот должен быть админом):", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("Введите @username канала (бот должен быть админом):")
         return WAITING_CHANNEL_USERNAME
     elif text == "➕ Добавить чаты":
-        await update.message.reply_text("Введите числовой ID чата или @username:", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("Введите числовой ID чата или @username:")
         return WAITING_CHAT_LINK
     elif text == "📩 Проверить поддержку":
         await show_support_messages(update, context)
@@ -4208,7 +4055,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📦 Выставить пак в магазин":
         return await admin_set_pack_time_start(update, context)
     elif text == "🔍 Инвентарь игрока":
-        await update.message.reply_text("🔍 Введите @username или ID игрока:", reply_markup=back_reply_keyboard())
+        await update.message.reply_text("🔍 Введите @username или ID игрока:")
         return WAITING_VIEW_USER_INV
     elif text == "👥 Список игроков":
         await admin_show_players_list(update, context)
@@ -4220,12 +4067,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в админ-меню.", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
-
-    username = text
+    username = update.message.text.strip()
     if not username.startswith('@'):
         username = '@' + username
     try:
@@ -4233,22 +4075,17 @@ async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYP
         add_source_channel(chat.id, username, update.effective_user.id)
         await update.message.reply_text(f"✅ Канал {username} добавлен.", reply_markup=admin_menu_keyboard())
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=admin_menu_keyboard())
+        await update.message.reply_text(f"❌ Ошибка: {e}")
     return ConversationHandler.END
 
 async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("⚙️ Возврат в админ-меню.", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
-
-    link = text
+    link = update.message.text.strip()
     try:
         chat = await context.bot.get_chat(link)
         add_target_chat(chat.id, link, update.effective_user.id)
         await update.message.reply_text(f"✅ Чат {link} добавлен.", reply_markup=admin_menu_keyboard())
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=admin_menu_keyboard())
+        await update.message.reply_text(f"❌ Ошибка: {e}")
     return ConversationHandler.END
 
 async def show_support_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4286,26 +4123,26 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data == "main_menu_nav":
-        await query.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_keyboard())
+    if data == "back_to_main_inline":
+        await query.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
     elif data == "discord":
         await query.message.reply_text("💬 **Discord:** https://discord.gg/dgkFMCgDwx")
     elif data == "website":
         await query.message.reply_text("🌐 **Сайт:** rplpuck.ru")
     elif data == "support":
-        await query.message.reply_text("✍️ Напишите ваше сообщение в поддержку текстом:", reply_markup=back_reply_keyboard())
+        await query.message.reply_text("✍️ Напишите ваше сообщение в поддержку текстом:")
         return WAITING_SUPPORT_MSG
     elif data == "duel":
         await query.message.reply_text("🏒 **Дуэль Буллитов!** Выбери зону:", reply_markup=duel_shot_keyboard())
         return WAITING_DUEL_SHOT
     elif data == "play_rps":
-        await query.message.reply_text("🎮 **Камень - Ножницы - Бумага**\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+        await query.message.reply_text("🎮 **Камень - Ножницы - Бумага**\nВведите ставку в RPLCoin (целое число):", reply_markup=bet_cancel_keyboard(), parse_mode="Markdown")
         return WAITING_RPS_BET
     elif data == "play_slots":
-        await query.message.reply_text("🎰 **Игровые Слоты**\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+        await query.message.reply_text("🎰 **Игровые Слоты**\nВведите ставку в RPLCoin (целое число):", reply_markup=bet_cancel_keyboard(), parse_mode="Markdown")
         return WAITING_SLOTS_BET
     elif data == "play_dice":
-        await query.message.reply_text("🎲 **Игра в Кости**\nСначала бросает бот, затем бот бросает за вас!\nВведите ставку в RPLCoin (целое число):", parse_mode="Markdown", reply_markup=back_reply_keyboard())
+        await query.message.reply_text("🎲 **Игра в Кости**\nСначала бросает бот, затем бот бросает за вас!\nВведите ставку в RPLCoin (целое число):", reply_markup=bet_cancel_keyboard(), parse_mode="Markdown")
         return WAITING_DICE_BET
 
 async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4319,17 +4156,66 @@ async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text in MENU_BUTTONS:
-        await update.message.reply_text("🔙 Отмена обращения в поддержку.", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-
     user = update.effective_user
-    add_support_message(user.id, user.username or str(user.id), text)
-    await update.message.reply_text("✅ Сообщение отправлено в поддержку.", reply_markup=main_menu_keyboard())
+    add_support_message(user.id, user.username or str(user.id), update.message.text)
+    await update.message.reply_text("✅ Сообщение отправлено в поддержку.")
     return ConversationHandler.END
 
 # ---------- MAIN ----------
+# ---------- ЗАЩИТА ОТ "ЗАСТРЕВАНИЯ" В ВВОДЕ СТАВКИ ----------
+# Раньше, если игрок вводил некорректную ставку (или ставку больше баланса) в
+# Слотах / Костях / КНБ, бот оставался в состоянии "жду ставку" НАВСЕГДА.
+# Любое следующее сообщение (в том числе нажатие обычной кнопки меню) снова
+# воспринималось как попытка ввести ставку и бот писал "Введите ставку числом!"
+# по кругу, блокируя весь бот для игрока. Ниже — обработчик-предохранитель:
+# если во время ожидания ставки игрок нажимает ЛЮБУЮ кнопку главного меню,
+# мы аккуратно отменяем мини-игру и выполняем то действие, которое он выбрал.
+MAIN_MENU_TEXT_HANDLERS = {
+    "🏠 Главное меню": main_menu,
+    "🃏 Бесплатная карта": rplcards_command,
+    "🎒 Инвентарь": inventory_command,
+    "🛒 Торговая площадка": cardshop_command,
+    "🏒 Состав и Профиль": profile_command,
+    "⚔️ Искать игру": cardmatch_command,
+    "🛒 Магазин Паков": shop_command,
+    "🏆 Топ MMR": cardmmr_command,
+    "🤝 Трейд": trade_command,
+    "🎁 Промокод": promo_command,
+    "🎡 Колесо удачи": wheel_command,
+    "🎁 Ежедневный бонус": daily_command,
+    "🎮 Мини-игры": minigames_menu,
+}
+MAIN_MENU_REGEX = "^(" + "|".join(re.escape(k) for k in MAIN_MENU_TEXT_HANDLERS) + ")$"
+
+async def bet_state_menu_escape(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Срабатывает, если во время ввода ставки игрок нажал кнопку главного меню."""
+    context.user_data.pop("rps_bet", None)
+    text = update.message.text
+    handler = MAIN_MENU_TEXT_HANDLERS.get(text)
+    if handler:
+        await handler(update, context)
+    return ConversationHandler.END
+
+async def cancel_minigame_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает инлайн-кнопку "🔙 Назад" на экране ввода ставки."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("rps_bet", None)
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎮 Камень-Ножницы-Бумага", callback_data="play_rps")],
+        [InlineKeyboardButton("🎰 Слоты", callback_data="play_slots")],
+        [InlineKeyboardButton("🎲 Кости", callback_data="play_dice")]
+    ])
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="🕹 **Выберите мини-игру:**", reply_markup=kb, parse_mode="Markdown")
+    return ConversationHandler.END
+
+def bet_cancel_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="cancel_minigame")]])
+
 def main():
     app = Application.builder().token(TOKEN).build()
 
@@ -4341,7 +4227,7 @@ def main():
             WAITING_LOGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_login)],
             WAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_password)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=main_menu_keyboard()))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         per_message=False,
     )
     app.add_handler(conv_auth)
@@ -4349,7 +4235,7 @@ def main():
     conv_channel = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить каналы$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={WAITING_CHANNEL_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_username)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=admin_menu_keyboard()))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         per_message=False,
     )
     app.add_handler(conv_channel)
@@ -4357,7 +4243,7 @@ def main():
     conv_chat = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить чаты$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={WAITING_CHAT_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_chat_link)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=admin_menu_keyboard()))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         per_message=False,
     )
     app.add_handler(conv_chat)
@@ -4365,7 +4251,7 @@ def main():
     conv_user_inv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔍 Инвентарь игрока$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={WAITING_VIEW_USER_INV: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_view_inventory_execute)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=admin_menu_keyboard()))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         per_message=False,
     )
     app.add_handler(conv_user_inv)
@@ -4373,7 +4259,7 @@ def main():
     conv_support = ConversationHandler(
         entry_points=[CallbackQueryHandler(inline_callback, pattern="^support$")],
         states={WAITING_SUPPORT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_receive)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=main_menu_keyboard()))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         per_message=False,
     )
     app.add_handler(conv_support)
@@ -4381,7 +4267,7 @@ def main():
     conv_duel = ConversationHandler(
         entry_points=[CallbackQueryHandler(inline_callback, pattern="^duel$")],
         states={WAITING_DUEL_SHOT: [CallbackQueryHandler(duel_shot, pattern="^shot_")]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=main_menu_keyboard()))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         per_message=False,
     )
     app.add_handler(conv_duel)
@@ -4392,7 +4278,7 @@ def main():
             MessageHandler(filters.Regex("^🎁 Промокод$"), promo_command)
         ],
         states={WAITING_PROMO_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_input_receive)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=main_menu_keyboard()))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         per_message=False,
     )
     app.add_handler(conv_promo_user)
@@ -4400,7 +4286,7 @@ def main():
     conv_market_price = ConversationHandler(
         entry_points=[CallbackQueryHandler(market_callback_handler, pattern="^select_mcard_")],
         states={WAITING_MARKET_PRICE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, execute_market_list_price)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=main_menu_keyboard()))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         per_message=False,
     )
     app.add_handler(conv_market_price)
@@ -4408,7 +4294,7 @@ def main():
     conv_trade_money = ConversationHandler(
         entry_points=[CallbackQueryHandler(trade_callback_handler, pattern="^tr_addmoney_")],
         states={WAITING_TRADE_MONEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, execute_trade_money_input)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=main_menu_keyboard()))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         per_message=False,
     )
     app.add_handler(conv_trade_money)
@@ -4416,10 +4302,17 @@ def main():
     conv_rps = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(inline_callback, pattern="^play_rps$"),
-            CommandHandler("rps", rps_command)
+            MessageHandler(filters.Regex("^🎮 Мини-игры$"), minigames_menu),
+            CommandHandler("rps", rps_command),
         ],
-        states={WAITING_RPS_BET: [MessageHandler(filters.TEXT & ~filters.COMMAND, rps_receive_bet)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=main_menu_keyboard()))],
+        states={WAITING_RPS_BET: [
+            MessageHandler(filters.Regex(MAIN_MENU_REGEX), bet_state_menu_escape),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, rps_receive_bet),
+        ]},
+        fallbacks=[
+            CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.")),
+            CallbackQueryHandler(cancel_minigame_callback, pattern="^cancel_minigame$"),
+        ],
         per_message=False,
     )
     app.add_handler(conv_rps)
@@ -4427,10 +4320,16 @@ def main():
     conv_slots = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(inline_callback, pattern="^play_slots$"),
-            CommandHandler("slots", slots_command)
+            CommandHandler("slots", slots_command),
         ],
-        states={WAITING_SLOTS_BET: [MessageHandler(filters.TEXT & ~filters.COMMAND, slots_receive_bet)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=main_menu_keyboard()))],
+        states={WAITING_SLOTS_BET: [
+            MessageHandler(filters.Regex(MAIN_MENU_REGEX), bet_state_menu_escape),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, slots_receive_bet),
+        ]},
+        fallbacks=[
+            CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.")),
+            CallbackQueryHandler(cancel_minigame_callback, pattern="^cancel_minigame$"),
+        ],
         per_message=False,
     )
     app.add_handler(conv_slots)
@@ -4438,10 +4337,16 @@ def main():
     conv_dice = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(inline_callback, pattern="^play_dice$"),
-            CommandHandler("dice", dice_command)
+            CommandHandler("dice", dice_command),
         ],
-        states={WAITING_DICE_BET: [MessageHandler(filters.TEXT & ~filters.COMMAND, dice_receive_bet)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=main_menu_keyboard()))],
+        states={WAITING_DICE_BET: [
+            MessageHandler(filters.Regex(MAIN_MENU_REGEX), bet_state_menu_escape),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, dice_receive_bet),
+        ]},
+        fallbacks=[
+            CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.")),
+            CallbackQueryHandler(cancel_minigame_callback, pattern="^cancel_minigame$"),
+        ],
         per_message=False,
     )
     app.add_handler(conv_dice)
@@ -4454,7 +4359,7 @@ def main():
             ADMIN_SHOP_PACK_SELECT: [CallbackQueryHandler(admin_shop_pack_callback, pattern="^adm_pack_")],
             ADMIN_SHOP_PACK_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_shop_pack_hours_receive)]
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=admin_menu_keyboard()))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         per_message=False,
     )
     app.add_handler(conv_admin_shop_pack)
@@ -4467,7 +4372,7 @@ def main():
             ADD_TEAM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_team_name)],
             ADD_TEAM_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_team_emoji)],
             ADD_TEAM_PHOTO: [MessageHandler(filters.PHOTO | filters.TEXT, save_team_photo)],
-            DEL_TEAM_SELECT: [CallbackQueryHandler(delete_team_callback, pattern="^(del_team_|admin_card_back)")],
+            DEL_TEAM_SELECT: [CallbackQueryHandler(delete_team_callback, pattern="^del_team_")],
             ADD_CARD_RARITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_rarity)],
             ADD_CARD_COLLECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_collection)],
             ADD_CARD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_country)],
@@ -4475,13 +4380,13 @@ def main():
             ADD_CARD_TEAM: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_team)],
             ADD_CARD_NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_nick)],
             ADD_CARD_OVR: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_ovr)],
-            ADD_CARD_PHOTO: [MessageHandler(filters.PHOTO | filters.ANIMATION | filters.TEXT, card_save_all)],
+            ADD_CARD_PHOTO: [MessageHandler(filters.PHOTO | filters.ANIMATION, card_save_all)],
             DEL_CARD_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_card_execute)],
             ADD_PACK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, pack_set_name)],
             ADD_PACK_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, pack_set_price)],
             ADD_PACK_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pack_set_limit)],
             ADD_PACK_CARDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, pack_set_cards)],
-            ADD_PACK_PHOTO: [MessageHandler(filters.PHOTO | filters.TEXT, pack_save_all)],
+            ADD_PACK_PHOTO: [MessageHandler(filters.PHOTO, pack_save_all)],
             FREEPACK_ADMIN_SELECT_CARDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_freepack_setup_receive)],
             GRANT_CARD_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, grant_card_execute)],
             GIVE_MONEY_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, give_money_execute)],
@@ -4490,7 +4395,7 @@ def main():
             ADD_PROMO_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_promo_set_val)],
             ADD_PROMO_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_promo_save)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.", reply_markup=card_admin_keyboard()))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         allow_reentry=True,
         per_message=False,
     )
@@ -4498,6 +4403,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.Regex("^(📩 Проверить поддержку|⚙️ Настройки|🎮 Настройки игры|👥 Список игроков|🚪 Выйти)$") & filters.ChatType.PRIVATE, admin_buttons))
 
+    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("freepack", freepack_command))
     app.add_handler(CommandHandler("rplcards", rplcards_command))
@@ -4511,7 +4417,9 @@ def main():
     app.add_handler(CommandHandler("trade", trade_command))
     app.add_handler(CommandHandler("daily", daily_command))
     app.add_handler(CommandHandler("wheel", wheel_command))
+    app.add_handler(CommandHandler("rps", rps_command))
 
+    # Текстовое меню
     app.add_handler(MessageHandler(filters.Regex("^🏠 Главное меню$"), main_menu))
     app.add_handler(MessageHandler(filters.Regex("^🃏 Бесплатная карта$"), rplcards_command))
     app.add_handler(MessageHandler(filters.Regex("^🎒 Инвентарь$"), inventory_command))
@@ -4525,6 +4433,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🎁 Ежедневный бонус$"), daily_command))
     app.add_handler(MessageHandler(filters.Regex("^🎮 Мини-игры$"), minigames_menu))
 
+    # Callback Handlers
     app.add_handler(CallbackQueryHandler(inventory_callback_handler, pattern="^(refresh_inv|craft_leg_|sell_menu|do_sell_)"))
     app.add_handler(CallbackQueryHandler(market_callback_handler, pattern="^(refresh_market|my_market_items|market_list_menu|cancel_market_|buy_market_)"))
     app.add_handler(CallbackQueryHandler(trade_callback_handler, pattern="^(accept_trade_|decline_trade_|tr_)"))
@@ -4533,6 +4442,7 @@ def main():
     app.add_handler(CallbackQueryHandler(shop_callback_handler, pattern="^(preview_pack_|confirm_pack_|cancel_pack_buy)"))
     app.add_handler(CallbackQueryHandler(freepack_callback_handler, pattern="^claim_freepack_btn$"))
     app.add_handler(CallbackQueryHandler(rps_callback_handler, pattern="^rps_"))
+    app.add_handler(CallbackQueryHandler(cancel_minigame_callback, pattern="^cancel_minigame$"))
     app.add_handler(CallbackQueryHandler(admin_shop_pack_callback, pattern="^adm_pack_"))
     app.add_handler(CallbackQueryHandler(inline_callback))
 
