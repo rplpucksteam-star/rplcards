@@ -4,7 +4,7 @@ import asyncio
 import random
 import time
 from datetime import datetime, timedelta
-import psycopg2
+import psycopg2ф
 from psycopg2.extras import RealDictCursor
 
 from telegram import (
