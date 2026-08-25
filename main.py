@@ -105,7 +105,11 @@ SELL_PRICES = {
     # Админ выставление паков на время
     ADMIN_SHOP_PACK_SELECT,
     ADMIN_SHOP_PACK_HOURS,
-) = range(47)
+    # Настройка команды игрока
+    TEAM_SET_NAME,
+    TEAM_SET_COUNTRY,
+    TEAM_SET_EMOJI,
+) = range(50)
 
 # ---------- БД (PostgreSQL) ----------
 def get_db():
@@ -129,14 +133,34 @@ def init_db():
             last_wheel_spin TIMESTAMP,
             free_card_cooldown_reset_until TIMESTAMP,
             freepack_claimed BOOLEAN DEFAULT FALSE,
-            discount_percent INTEGER DEFAULT 0
+            discount_percent INTEGER DEFAULT 0,
+            matches_played INTEGER DEFAULT 0,
+            wins INTEGER DEFAULT 0,
+            losses INTEGER DEFAULT 0,
+            goals_scored INTEGER DEFAULT 0,
+            goals_conceded INTEGER DEFAULT 0,
+            team_name TEXT,
+            team_country TEXT,
+            team_emoji TEXT,
+            notif_fcard_sent BOOLEAN DEFAULT FALSE,
+            notif_wheel_sent BOOLEAN DEFAULT FALSE
         )
     ''')
     c.execute('''
         ALTER TABLE users
         ADD COLUMN IF NOT EXISTS free_card_cooldown_reset_until TIMESTAMP,
         ADD COLUMN IF NOT EXISTS freepack_claimed BOOLEAN DEFAULT FALSE,
-        ADD COLUMN IF NOT EXISTS discount_percent INTEGER DEFAULT 0
+        ADD COLUMN IF NOT EXISTS discount_percent INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS matches_played INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS wins INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS losses INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS goals_scored INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS goals_conceded INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS team_name TEXT,
+        ADD COLUMN IF NOT EXISTS team_country TEXT,
+        ADD COLUMN IF NOT EXISTS team_emoji TEXT,
+        ADD COLUMN IF NOT EXISTS notif_fcard_sent BOOLEAN DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS notif_wheel_sent BOOLEAN DEFAULT FALSE
     ''')
     
     # Существующие системы
@@ -951,6 +975,13 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
+    # Сброс флага уведомления
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET notif_wheel_sent = FALSE WHERE user_id = %s", (user.id,))
+    conn.commit()
+    conn.close()
+
     await update.message.reply_text(
         f"🎡 **Колесо удачи прокручено!**\n\n{prize_text}",
         parse_mode="Markdown"
@@ -1493,6 +1524,9 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.execute("UPDATE users SET free_card_cooldown_reset_until = NULL WHERE user_id = %s", (user.id,))
     else:
         c.execute("UPDATE users SET last_card_claim = %s WHERE user_id = %s", (now, user.id))
+
+    # Сброс флага уведомления
+    c.execute("UPDATE users SET notif_fcard_sent = FALSE WHERE user_id = %s", (user.id,))
         
     conn.commit()
     conn.close()
@@ -2050,6 +2084,27 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("❌ Не удалось отправить уведомление игроку (возможно, бот заблокирован им).")
 
+async def trade_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    trade_id_to_remove = None
+    for tid, tdata in active_trades.items():
+        if user.id in (tdata['p1'], tdata['p2']):
+            trade_id_to_remove = tid
+            break
+    if trade_id_to_remove is None:
+        await update.message.reply_text("❌ У вас нет активного трейда.")
+        return
+
+    tdata = active_trades.pop(trade_id_to_remove)
+    # Уведомляем обоих игроков
+    for uid, mid in tdata['msgs'].items():
+        if mid:
+            try:
+                await context.bot.edit_message_text(chat_id=uid, message_id=mid, text="🚫 **Трейд отменен командой /tradecancel.**", parse_mode="Markdown")
+            except Exception:
+                pass
+    await update.message.reply_text("✅ Трейд успешно отменен.")
+
 async def render_trade_text(tdata, for_user_id):
     conn = get_db()
     c = conn.cursor()
@@ -2561,6 +2616,17 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ORDER BY c.ovr DESC LIMIT 1
     ''', (user.id,))
     best_goalie = c.fetchone()
+
+    # Статистика
+    matches = u_data.get('matches_played', 0)
+    wins = u_data.get('wins', 0)
+    losses = u_data.get('losses', 0)
+    goals_scored = u_data.get('goals_scored', 0)
+    goals_conceded = u_data.get('goals_conceded', 0)
+    team_name = u_data.get('team_name')
+    team_country = u_data.get('team_country')
+    team_emoji = u_data.get('team_emoji')
+
     conn.close()
 
     avg_ovr = round(total_ovr / 5, 1) if count_filled == 5 else 0
@@ -2569,12 +2635,23 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     disc_str = f"🏷 Активная скидка: **{u_data.get('discount_percent', 0)}%**\n" if u_data.get('discount_percent', 0) > 0 else ""
 
+    team_str = ""
+    if team_name:
+        team_str = f"🏒 Команда: {team_emoji or '🏒'} **{team_name}** ({team_country or 'Не указана'})\n"
+
     text = (
         f"🏒 **Профиль игрока {user.first_name}:**\n\n"
         f"💳 Баланс: **{u_data['balance']} RPLCoin**\n"
         f"🏆 Рейтинг MMR: **{u_data['mmr']}**\n"
         f"{disc_str}"
+        f"{team_str}"
         f"⭐ Средний OVR Состава: **{avg_ovr if avg_ovr > 0 else 'Состав не собран'}**\n\n"
+        f"📊 **Статистика матчей:**\n"
+        f"🏒 Сыграно матчей: **{matches}**\n"
+        f"🏆 Побед: **{wins}**\n"
+        f"❌ Поражений: **{losses}**\n"
+        f"⚽ Голов забито: **{goals_scored}**\n"
+        f"🥅 Пропущено: **{goals_conceded}**\n\n"
         f"🏒 Лучший Skater: {best_skater_str}\n"
         f"🧤 Лучший Goalie: {best_goalie_str}\n\n"
         f"📋 **Текущий Состав (1 Goalie + 4 Skaters):**\n"
@@ -2588,6 +2665,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Изменить Состав", callback_data="edit_roster_menu")],
+        [InlineKeyboardButton("🏒 Настройка команды", callback_data="edit_team_menu")],
         [InlineKeyboardButton("🔄 Обновить", callback_data="refresh_profile")]
     ])
 
@@ -2681,6 +2759,68 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
 
         await query.answer("✅ Карточка успешно установлена!")
         await show_profile(update, context)
+
+    elif data == "edit_team_menu":
+        # Настройка команды игрока
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 Изменить название", callback_data="team_set_name")],
+            [InlineKeyboardButton("🌍 Изменить страну", callback_data="team_set_country")],
+            [InlineKeyboardButton("🎨 Изменить эмодзи", callback_data="team_set_emoji")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="refresh_profile")]
+        ])
+        await query.edit_message_text("🏒 **Настройка вашей команды:**", reply_markup=kb, parse_mode="Markdown")
+
+    elif data.startswith("team_set_"):
+        action = data.replace("team_set_", "")
+        if action == "name":
+            await query.message.reply_text("📝 Введите новое название команды:")
+            return TEAM_SET_NAME
+        elif action == "country":
+            # Предложим список стран
+            kb = [COUNTRIES[i:i+3] for i in range(0, len(COUNTRIES), 3)]
+            await query.message.reply_text("🌍 Выберите страну команды (или введите свою):", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+            return TEAM_SET_COUNTRY
+        elif action == "emoji":
+            await query.message.reply_text("🎨 Введите один эмодзи для команды (например: 🏒, ⚡, 🟢):")
+            return TEAM_SET_EMOJI
+
+    elif data.startswith("team_set_done"):
+        # После ввода названия, страны или эмодзи мы возвращаемся в профиль
+        await show_profile(update, context)
+
+# Обработчики для настройки команды
+async def team_set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET team_name = %s WHERE user_id = %s", (name, update.effective_user.id))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ Название команды установлено: **{name}**")
+    await show_profile(update, context)
+    return ConversationHandler.END
+
+async def team_set_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    country = update.message.text.strip()
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET team_country = %s WHERE user_id = %s", (country, update.effective_user.id))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ Страна команды установлена: **{country}**")
+    await show_profile(update, context)
+    return ConversationHandler.END
+
+async def team_set_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    emoji = update.message.text.strip()
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET team_emoji = %s WHERE user_id = %s", (emoji, update.effective_user.id))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ Эмодзи команды установлен: {emoji}")
+    await show_profile(update, context)
+    return ConversationHandler.END
 
 # ---------- МАТЧИ И ПОИСК СОПЕРНИКА (/cardmatch) С УСТАЛОСТЬЮ И РАShared EVENTS ----------
 active_searches = {}
@@ -2930,6 +3070,10 @@ def format_cards_list(cards_dict):
         lines.append(f"  • {label}: **{v['nickname']}** ({v['ovr']} OVR)")
     return "\n".join(lines)
 
+def get_user_team_info(cursor, user_id):
+    cursor.execute("SELECT team_name, team_country, team_emoji, mmr, first_name, username FROM users WHERE user_id = %s", (user_id,))
+    return cursor.fetchone()
+
 async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg_id, context):
     active_games.add(p1_id)
     active_games.add(p2_id)
@@ -2940,6 +3084,10 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
         u1 = c.fetchone()
         c.execute("SELECT * FROM users WHERE user_id = %s", (p2_id,))
         u2 = c.fetchone()
+
+        # Получаем информацию о командах игроков
+        team1 = get_user_team_info(c, p1_id)
+        team2 = get_user_team_info(c, p2_id)
 
         c.execute("SELECT * FROM user_rosters WHERE user_id = %s", (p1_id,))
         r1 = c.fetchone()
@@ -2961,6 +3109,10 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
         name1 = u1['first_name'] or u1['username'] or str(p1_id)
         name2 = u2['first_name'] or u2['username'] or str(p2_id)
 
+        # Формируем информацию о командах
+        team1_str = f"{team1['team_emoji'] or '🏒'} **{team1['team_name'] or 'Без команды'}** ({team1['team_country'] or 'Не указана'})" if team1 else "Без команды"
+        team2_str = f"{team2['team_emoji'] or '🏒'} **{team2['team_name'] or 'Без команды'}** ({team2['team_country'] or 'Не указана'})" if team2 else "Без команды"
+
         roster1_text = format_cards_list(p1_cards)
         roster2_text = format_cards_list(p2_cards)
 
@@ -2968,7 +3120,9 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
             f"╔═══════════════════════════════╗\n"
             f"  🏒 **РХЛ: ПРЯМАЯ ТРАНСЛЯЦИЯ** 🏒  \n"
             f"╚═══════════════════════════════╝\n"
-            f"🔴 **{name1}** ({p1_ovr:.1f} OVR) vs 🔵 **{name2}** ({p2_ovr:.1f} OVR)\n\n"
+            f"🔴 **{name1}** ({p1_ovr:.1f} OVR) — {team1_str}\n"
+            f"🔵 **{name2}** ({p2_ovr:.1f} OVR) — {team2_str}\n"
+            f"🏆 MMR: {u1['mmr']} vs {u2['mmr']}\n\n"
             f"📋 **Состав {name1}:**\n{roster1_text}\n\n"
             f"📋 **Состав {name2}:**\n{roster2_text}\n\n"
             f"───────────────────────────\n"
@@ -3168,16 +3322,16 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
 
         if score1 > score2:
             res_text = f"🎉 **ПОБЕДА 🔴 {name1}!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p1_id, is_win=True)
-            apply_match_rewards(c, p2_id, is_win=False)
+            apply_match_rewards(c, p1_id, is_win=True, goals_scored=score1, goals_conceded=score2)
+            apply_match_rewards(c, p2_id, is_win=False, goals_scored=score2, goals_conceded=score1)
         elif score2 > score1:
             res_text = f"🎉 **ПОБЕДА 🔵 {name2}!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p2_id, is_win=True)
-            apply_match_rewards(c, p1_id, is_win=False)
+            apply_match_rewards(c, p2_id, is_win=True, goals_scored=score2, goals_conceded=score1)
+            apply_match_rewards(c, p1_id, is_win=False, goals_scored=score1, goals_conceded=score2)
         else:
             res_text = f"🤝 **НИЧЬЯ!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p1_id, is_win=None)
-            apply_match_rewards(c, p2_id, is_win=None)
+            apply_match_rewards(c, p1_id, is_win=None, goals_scored=score1, goals_conceded=score2)
+            apply_match_rewards(c, p2_id, is_win=None, goals_scored=score2, goals_conceded=score1)
 
         conn.commit()
         conn.close()
@@ -3204,6 +3358,9 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
         c = conn.cursor()
         c.execute("SELECT * FROM users WHERE user_id = %s", (p1_id,))
         u1 = c.fetchone()
+
+        # Информация о команде игрока
+        team1 = get_user_team_info(c, p1_id)
 
         c.execute("SELECT * FROM user_rosters WHERE user_id = %s", (p1_id,))
         r1 = c.fetchone()
@@ -3255,6 +3412,8 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
         ai_ovr = sum(cd['ovr'] for cd in ai_cards.values()) / 5.0
         name1 = u1['first_name'] or u1['username'] or str(p1_id)
 
+        team1_str = f"{team1['team_emoji'] or '🏒'} **{team1['team_name'] or 'Без команды'}** ({team1['team_country'] or 'Не указана'})" if team1 else "Без команды"
+
         roster1_text = format_cards_list(p1_cards)
         roster2_text = format_cards_list(ai_cards)
 
@@ -3262,7 +3421,9 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
             f"╔═══════════════════════════════╗\n"
             f"  🏒 **РХЛ: МАТЧ ПРОТИВ ИИ БОТА** 🏒  \n"
             f"╚═══════════════════════════════╝\n"
-            f"🔴 **{name1}** ({p1_ovr:.1f} OVR) vs 🤖 **ИИ Бот** ({ai_ovr:.1f} OVR)\n\n"
+            f"🔴 **{name1}** ({p1_ovr:.1f} OVR) — {team1_str}\n"
+            f"🤖 **ИИ Бот** ({ai_ovr:.1f} OVR) — Без команды\n"
+            f"🏆 MMR: {u1['mmr']} vs ИИ\n\n"
             f"📋 **Состав {name1}:**\n{roster1_text}\n\n"
             f"📋 **Состав ИИ Бота:**\n{roster2_text}\n\n"
             f"───────────────────────────\n"
@@ -3421,13 +3582,13 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
 
         if score1 > score2:
             res_text = f"🎉 **ПОБЕДА НАД ИИ БОТОМ!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p1_id, is_win=True)
+            apply_match_rewards(c, p1_id, is_win=True, goals_scored=score1, goals_conceded=score2)
         elif score2 > score1:
             res_text = f"❌ **ПОРАЖЕНИЕ ОТ ИИ БОТА!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p1_id, is_win=False)
+            apply_match_rewards(c, p1_id, is_win=False, goals_scored=score1, goals_conceded=score2)
         else:
             res_text = f"🤝 **НИЧЬЯ С ИИ БОТОМ!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p1_id, is_win=None)
+            apply_match_rewards(c, p1_id, is_win=None, goals_scored=score1, goals_conceded=score2)
 
         conn.commit()
         conn.close()
@@ -3456,11 +3617,14 @@ def get_roster_cards(cursor, roster):
         "skater4": cds[roster['skater4_id']]
     }
 
-def apply_match_rewards(cursor, user_id, is_win):
+def apply_match_rewards(cursor, user_id, is_win, goals_scored=0, goals_conceded=0):
+    # Обновляем статистику
+    cursor.execute("UPDATE users SET matches_played = matches_played + 1, goals_scored = goals_scored + %s, goals_conceded = goals_conceded + %s WHERE user_id = %s", 
+                   (goals_scored, goals_conceded, user_id))
     if is_win is True:
-        cursor.execute("UPDATE users SET mmr = mmr + 50, balance = balance + 2000 WHERE user_id = %s", (user_id,))
+        cursor.execute("UPDATE users SET mmr = mmr + 50, balance = balance + 2000, wins = wins + 1 WHERE user_id = %s", (user_id,))
     elif is_win is False:
-        cursor.execute("UPDATE users SET mmr = GREATEST(0, mmr - 50), balance = balance + 500 WHERE user_id = %s", (user_id,))
+        cursor.execute("UPDATE users SET mmr = GREATEST(0, mmr - 50), balance = balance + 500, losses = losses + 1 WHERE user_id = %s", (user_id,))
     else:
         cursor.execute("UPDATE users SET balance = balance + 500 WHERE user_id = %s", (user_id,))
 
@@ -4487,8 +4651,48 @@ async def cancel_minigame_callback(update: Update, context: ContextTypes.DEFAULT
 def bet_cancel_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="cancel_minigame")]])
 
+# ---------- ФОНОВЫЙ ПРОЦЕСС УВЕДОМЛЕНИЙ ----------
+async def notification_worker(context: ContextTypes.DEFAULT_TYPE):
+    while True:
+        try:
+            conn = get_db()
+            c = conn.cursor()
+            now = datetime.now()
+
+            # Уведомления о бесплатной карте
+            c.execute("SELECT user_id FROM users WHERE free_card_cooldown_reset_until IS NULL AND last_card_claim IS NOT NULL AND last_card_claim + INTERVAL '8 hours' < %s AND notif_fcard_sent = FALSE", (now,))
+            rows = c.fetchall()
+            for row in rows:
+                uid = row['user_id']
+                try:
+                    await context.bot.send_message(uid, "⏳ **КД на бесплатную карточку истек!** Вы можете получить новую карту командой /rplcards или через кнопку в меню.", parse_mode="Markdown")
+                except Exception:
+                    pass
+                c.execute("UPDATE users SET notif_fcard_sent = TRUE WHERE user_id = %s", (uid,))
+
+            # Уведомления о колесе удачи
+            c.execute("SELECT user_id FROM users WHERE last_wheel_spin IS NOT NULL AND last_wheel_spin + INTERVAL '36 hours' < %s AND notif_wheel_sent = FALSE", (now,))
+            rows = c.fetchall()
+            for row in rows:
+                uid = row['user_id']
+                try:
+                    await context.bot.send_message(uid, "🎡 **Колесо удачи доступно!** Вы можете крутить его командой /wheel или через кнопку в меню.", parse_mode="Markdown")
+                except Exception:
+                    pass
+                c.execute("UPDATE users SET notif_wheel_sent = TRUE WHERE user_id = %s", (uid,))
+
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error in notification worker: {e}")
+        await asyncio.sleep(30)  # Проверка каждые 30 секунд
+
+# ---------- ОСНОВНАЯ ФУНКЦИЯ ----------
 def main():
     app = Application.builder().token(TOKEN).build()
+
+    # Запускаем фоновый процесс уведомлений
+    asyncio.create_task(notification_worker(app))
 
     app.add_handler(CommandHandler("getid", getid_command))
 
@@ -4688,6 +4892,37 @@ def main():
     )
     app.add_handler(conv_cards)
 
+    # Конверсейшн для настройки команды игрока
+    conv_team_set = ConversationHandler(
+        entry_points=[CallbackQueryHandler(profile_callback_handler, pattern="^team_set_name$")],
+        states={
+            TEAM_SET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, team_set_name)],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
+    )
+    app.add_handler(conv_team_set)
+
+    conv_team_country = ConversationHandler(
+        entry_points=[CallbackQueryHandler(profile_callback_handler, pattern="^team_set_country$")],
+        states={
+            TEAM_SET_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, team_set_country)],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
+    )
+    app.add_handler(conv_team_country)
+
+    conv_team_emoji = ConversationHandler(
+        entry_points=[CallbackQueryHandler(profile_callback_handler, pattern="^team_set_emoji$")],
+        states={
+            TEAM_SET_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND, team_set_emoji)],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
+    )
+    app.add_handler(conv_team_emoji)
+
     app.add_handler(MessageHandler(filters.Regex("^(📩 Проверить поддержку|⚙️ Настройки|🎮 Настройки игры|👥 Список игроков|🚪 Выйти)$") & filters.ChatType.PRIVATE, admin_buttons))
 
     # Команды
@@ -4702,6 +4937,7 @@ def main():
     app.add_handler(CommandHandler("shop", shop_command))
     app.add_handler(CommandHandler("cardshop", cardshop_command))
     app.add_handler(CommandHandler("trade", trade_command))
+    app.add_handler(CommandHandler("tradecancel", trade_cancel_command))
     app.add_handler(CommandHandler("daily", daily_command))
     app.add_handler(CommandHandler("wheel", wheel_command))
     app.add_handler(CommandHandler("rps", rps_command))
@@ -4725,7 +4961,7 @@ def main():
     app.add_handler(CallbackQueryHandler(inventory_callback_handler, pattern="^(refresh_inv|craft_leg_|sell_menu|do_sell_)"))
     app.add_handler(CallbackQueryHandler(market_callback_handler, pattern="^(refresh_market|my_market_items|market_list_menu|cancel_market_|buy_market_)"))
     app.add_handler(CallbackQueryHandler(trade_callback_handler, pattern="^(accept_trade_|decline_trade_|tr_)"))
-    app.add_handler(CallbackQueryHandler(profile_callback_handler, pattern="^(refresh_profile|edit_roster_menu|set_pos_|apply_card_)"))
+    app.add_handler(CallbackQueryHandler(profile_callback_handler, pattern="^(refresh_profile|edit_roster_menu|set_pos_|apply_card_|edit_team_menu|team_set_)"))
     app.add_handler(CallbackQueryHandler(match_callback_handler, pattern="^(accept_match_|cancel_match_)"))
     app.add_handler(CallbackQueryHandler(shop_callback_handler, pattern="^(preview_pack_|confirm_pack_|cancel_pack_buy)"))
     app.add_handler(CallbackQueryHandler(freepack_callback_handler, pattern="^claim_freepack_btn$"))
