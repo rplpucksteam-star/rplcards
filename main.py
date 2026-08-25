@@ -2096,7 +2096,6 @@ async def trade_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     tdata = active_trades.pop(trade_id_to_remove)
-    # Уведомляем обоих игроков
     for uid, mid in tdata['msgs'].items():
         if mid:
             try:
@@ -4652,7 +4651,7 @@ def bet_cancel_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="cancel_minigame")]])
 
 # ---------- ФОНОВЫЙ ПРОЦЕСС УВЕДОМЛЕНИЙ ----------
-async def notification_worker(context: ContextTypes.DEFAULT_TYPE):
+async def notification_worker(app):
     while True:
         try:
             conn = get_db()
@@ -4665,7 +4664,7 @@ async def notification_worker(context: ContextTypes.DEFAULT_TYPE):
             for row in rows:
                 uid = row['user_id']
                 try:
-                    await context.bot.send_message(uid, "⏳ **КД на бесплатную карточку истек!** Вы можете получить новую карту командой /rplcards или через кнопку в меню.", parse_mode="Markdown")
+                    await app.bot.send_message(uid, "⏳ **КД на бесплатную карточку истек!** Вы можете получить новую карту командой /rplcards или через кнопку в меню.", parse_mode="Markdown")
                 except Exception:
                     pass
                 c.execute("UPDATE users SET notif_fcard_sent = TRUE WHERE user_id = %s", (uid,))
@@ -4676,7 +4675,7 @@ async def notification_worker(context: ContextTypes.DEFAULT_TYPE):
             for row in rows:
                 uid = row['user_id']
                 try:
-                    await context.bot.send_message(uid, "🎡 **Колесо удачи доступно!** Вы можете крутить его командой /wheel или через кнопку в меню.", parse_mode="Markdown")
+                    await app.bot.send_message(uid, "🎡 **Колесо удачи доступно!** Вы можете крутить его командой /wheel или через кнопку в меню.", parse_mode="Markdown")
                 except Exception:
                     pass
                 c.execute("UPDATE users SET notif_wheel_sent = TRUE WHERE user_id = %s", (uid,))
@@ -4688,11 +4687,12 @@ async def notification_worker(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(30)  # Проверка каждые 30 секунд
 
 # ---------- ОСНОВНАЯ ФУНКЦИЯ ----------
-def main():
-    app = Application.builder().token(TOKEN).build()
+async def post_init(application):
+    # Запускаем фоновую задачу уведомлений
+    asyncio.create_task(notification_worker(application))
 
-    # Запускаем фоновый процесс уведомлений
-    asyncio.create_task(notification_worker(app))
+def main():
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("getid", getid_command))
 
