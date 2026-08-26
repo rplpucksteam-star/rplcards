@@ -100,7 +100,7 @@ SELL_PRICES = {
     WAITING_TEAM_NAME,
     WAITING_TEAM_COUNTRY,
     WAITING_TEAM_EMOJI,
-) = range(49)
+) = range(50)
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -3707,14 +3707,24 @@ async def grant_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         conn = get_db()
         c = conn.cursor()
-        target_id = int(user_input) if user_input.isdigit() else c.execute("SELECT user_id FROM users WHERE username = %s", (user_input,)) or c.fetchone()['user_id']
+        
+        if user_input.isdigit():
+            target_id = int(user_input)
+        else:
+            c.execute("SELECT user_id FROM users WHERE username = %s", (user_input,))
+            u_row = c.fetchone()
+            if not u_row:
+                conn.close()
+                await update.message.reply_text("❌ Пользователь не найден!", reply_markup=card_admin_keyboard())
+                return CARD_ADMIN_MENU
+            target_id = u_row['user_id']
 
         c.execute("INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1) ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1", (target_id, card_id))
         conn.commit()
         conn.close()
         await update.message.reply_text(f"✅ Выдано!", reply_markup=card_admin_keyboard())
     except Exception:
-        await update.message.reply_text("❌ Ошибка формата!", reply_markup=card_admin_keyboard())
+        await update.message.reply_text("❌ Ошибка формата! Пример: `@username 5`", reply_markup=card_admin_keyboard())
     return CARD_ADMIN_MENU
 
 async def give_money_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4002,7 +4012,6 @@ def bet_cancel_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="cancel_minigame")]])
 
 async def cooldown_notifier_loop(application: Application):
-    """Фоновый цикл проверки и отправки уведомлений об окончании КД карточки и колеса удачи."""
     await asyncio.sleep(10)
     while True:
         try:
@@ -4010,14 +4019,12 @@ async def cooldown_notifier_loop(application: Application):
             c = conn.cursor()
             now = datetime.now()
 
-            # Уведомления по бесплатным картам (КД 8 часов)
             c.execute("SELECT user_id, last_card_claim FROM users WHERE last_card_claim IS NOT NULL")
             users_card = c.fetchall()
             for u in users_card:
                 last_claim = u['last_card_claim']
                 if isinstance(last_claim, str):
                     last_claim = datetime.fromisoformat(last_claim)
-                # Проверяем, если прошло ровно 8 часов (с погрешностью в 1 минуту)
                 diff = (now - last_claim).total_seconds()
                 if 28740 <= diff <= 28860:
                     try:
@@ -4029,7 +4036,6 @@ async def cooldown_notifier_loop(application: Application):
                     except Exception:
                         pass
 
-            # Уведомления по колесу удачи (КД 36 часов)
             c.execute("SELECT user_id, last_wheel_spin FROM users WHERE last_wheel_spin IS NOT NULL")
             users_wheel = c.fetchall()
             for u in users_wheel:
@@ -4053,8 +4059,11 @@ async def cooldown_notifier_loop(application: Application):
         
         await asyncio.sleep(60)
 
+async def post_init_hook(application: Application):
+    asyncio.create_task(cooldown_notifier_loop(application))
+
 def main():
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init_hook).build()
 
     app.add_handler(CommandHandler("getid", getid_command))
     app.add_handler(CommandHandler("tradecancel", tradecancel_command))
@@ -4312,10 +4321,7 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_shop_pack_callback, pattern="^adm_pack_"))
     app.add_handler(CallbackQueryHandler(inline_callback))
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(cooldown_notifier_loop(app))
-
-    logger.info("Бот RPL успешно запущен с исправлениями и новыми функциями...")
+    logger.info("Бот RPL успешно запущен...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
