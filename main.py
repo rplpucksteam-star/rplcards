@@ -101,10 +101,11 @@ SELL_PRICES = {
     WAITING_RPS_BET,
     WAITING_SLOTS_BET,
     WAITING_DICE_BET,
+    WAITING_COIN_BET,
     # Админ выставление паков на время
     ADMIN_SHOP_PACK_SELECT,
     ADMIN_SHOP_PACK_HOURS,
-) = range(46)
+) = range(47)
 
 # ---------- БД (PostgreSQL) ----------
 def get_db():
@@ -127,15 +128,20 @@ def init_db():
             daily_streak INTEGER DEFAULT 0,
             last_wheel_spin TIMESTAMP,
             free_card_cooldown_reset_until TIMESTAMP,
-            freepack_claimed BOOLEAN DEFAULT FALSE
+            freepack_claimed BOOLEAN DEFAULT FALSE,
+            discount_percent INTEGER DEFAULT 0,
+            card_cd_notified BOOLEAN DEFAULT FALSE,
+            wheel_cd_notified BOOLEAN DEFAULT FALSE
         )
     ''')
-    # На случай, если таблица users уже существует из старой версии бота —
-    # добираем недостающие столбцы, чтобы не падать при апдейте.
+    
     c.execute('''
         ALTER TABLE users
         ADD COLUMN IF NOT EXISTS free_card_cooldown_reset_until TIMESTAMP,
-        ADD COLUMN IF NOT EXISTS freepack_claimed BOOLEAN DEFAULT FALSE
+        ADD COLUMN IF NOT EXISTS freepack_claimed BOOLEAN DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS discount_percent INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS card_cd_notified BOOLEAN DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS wheel_cd_notified BOOLEAN DEFAULT FALSE
     ''')
     
     # Существующие системы
@@ -260,14 +266,12 @@ def init_db():
         )
     ''')
 
-    # Конфигурация стартового набора (admin configured freepack)
     c.execute('''
         CREATE TABLE IF NOT EXISTS freepack_config (
             card_id INTEGER PRIMARY KEY REFERENCES cards(id) ON DELETE CASCADE
         )
     ''')
 
-    # Промокоды
     c.execute('''
         CREATE TABLE IF NOT EXISTS promo_codes (
             code TEXT PRIMARY KEY,
@@ -286,7 +290,6 @@ def init_db():
         )
     ''')
 
-    # Торговая площадка (Рынок)
     c.execute('''
         CREATE TABLE IF NOT EXISTS market (
             id SERIAL PRIMARY KEY,
@@ -297,6 +300,16 @@ def init_db():
         )
     ''')
     
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS pending_trades (
+            id SERIAL PRIMARY KEY,
+            sender_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            target_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(sender_id, target_id)
+        )
+    ''')
+
     c.execute("INSERT INTO bot_config (key, value) VALUES ('gif_goal', '') ON CONFLICT DO NOTHING")
     c.execute("INSERT INTO bot_config (key, value) VALUES ('gif_save', '') ON CONFLICT DO NOTHING")
     conn.commit()
@@ -373,13 +386,6 @@ def choose_card_for_user(cursor, user_id, candidate_cards):
         return random.choice(candidate_cards)
 
 def choose_new_card_strict(cursor, user_id, candidate_cards):
-    """
-    В отличие от choose_card_for_user, НИКОГДА не возвращает карту,
-    которая уже есть у игрока (без дублей/стаков). Если среди
-    candidate_cards нет ни одной новой карты — возвращает None,
-    и вызывающий код должен решить, что делать дальше (расширить
-    пул кандидатов или выдать компенсацию).
-    """
     if not candidate_cards:
         return None
 
@@ -513,6 +519,55 @@ def mark_answered(msg_id):
     conn = get_db()
     c = conn.cursor()
     c.execute('UPDATE support_messages SET answered = 1 WHERE id = %s', (msg_id,))
+    conn.commit()
+    conn.close()
+
+# ---------- ФОНОВАЯ ПРОВЕРКА КД (JobQueue) ----------
+async def cooldown_notification_job(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now()
+    conn = get_db()
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT user_id, last_card_claim
+        FROM users
+        WHERE last_card_claim IS NOT NULL
+          AND last_card_claim <= %s - INTERVAL '8 hours'
+          AND COALESCE(card_cd_notified, FALSE) = FALSE
+    """, (now,))
+    card_users = c.fetchall()
+
+    c.execute("""
+        SELECT user_id, last_wheel_spin
+        FROM users
+        WHERE last_wheel_spin IS NOT NULL
+          AND last_wheel_spin <= %s - INTERVAL '36 hours'
+          AND COALESCE(wheel_cd_notified, FALSE) = FALSE
+    """, (now,))
+    wheel_users = c.fetchall()
+
+    for row in card_users:
+        try:
+            await context.bot.send_message(
+                chat_id=row["user_id"],
+                text="✅ **КД на бесплатную карточку завершён!**\nТеперь снова доступна команда /rplcards.",
+                parse_mode="Markdown"
+            )
+            c.execute("UPDATE users SET card_cd_notified = TRUE WHERE user_id = %s", (row["user_id"],))
+        except Exception:
+            pass
+
+    for row in wheel_users:
+        try:
+            await context.bot.send_message(
+                chat_id=row["user_id"],
+                text="✅ **КД колеса удачи завершён!**\nТеперь снова можно использовать команду /wheel.",
+                parse_mode="Markdown"
+            )
+            c.execute("UPDATE users SET wheel_cd_notified = TRUE WHERE user_id = %s", (row["user_id"],))
+        except Exception:
+            pass
+
     conn.commit()
     conn.close()
 
@@ -700,8 +755,8 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.execute("UPDATE users SET balance = balance + 15000, daily_streak = %s, last_daily_claim = %s WHERE user_id = %s", (streak, now, user.id))
         reward_text = "15 000 RPLCoin 💳"
     elif streak == 4:
-        c.execute("UPDATE users SET daily_streak = %s, last_daily_claim = %s WHERE user_id = %s", (streak, now, user.id))
-        reward_text = "Скидку 15% в магазине на любую покупку 🏷"
+        c.execute("UPDATE users SET discount_percent = 15, daily_streak = %s, last_daily_claim = %s WHERE user_id = %s", (streak, now, user.id))
+        reward_text = "Скидку 15% в магазине паков и на торговой площадке 🏷"
     elif streak == 5:
         c.execute("UPDATE users SET free_card_cooldown_reset_until = %s, daily_streak = %s, last_daily_claim = %s WHERE user_id = %s", (datetime.max, streak, now, user.id))
         reward_text = "Обнуление КД на бесплатную карточку ✨"
@@ -779,7 +834,6 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prizes = ["reset_cd", "money", "card_50_65", "card_70_80", "card_80_85", "discount", "custom_card", "rare", "very_rare", "epic", "mythic", "nothing"]
 
-    # Приз "Создать карточку с рейтингом 82" может выпасть только 1 раз за всё время существования бота
     if get_config("custom_card_prize_claimed") == "1":
         prizes = [p for p in prizes if p != "custom_card"]
 
@@ -787,7 +841,7 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     c = conn.cursor()
-    c.execute("UPDATE users SET balance = balance - %s, last_wheel_spin = %s WHERE user_id = %s", (cost, now, user.id))
+    c.execute("UPDATE users SET balance = balance - %s, last_wheel_spin = %s, wheel_cd_notified = FALSE WHERE user_id = %s", (cost, now, user.id))
 
     prize_text = ""
     if prize == "reset_cd":
@@ -828,11 +882,12 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute("UPDATE users SET balance = balance + 70000 WHERE user_id = %s", (user.id,))
             prize_text = "💵 Карточек 80-85 не найдено, зачислено 70 000 RPLCoin!"
     elif prize == "discount":
-        disc = random.randint(1, 30)
-        prize_text = f"🏷 **Скидка {disc}%** на любую покупку в магазине!"
+        disc = random.randint(10, 35)
+        c.execute("UPDATE users SET discount_percent = %s WHERE user_id = %s", (disc, user.id))
+        prize_text = f"🏷 **Скидка {disc}%** на покупку паков в магазине и на торговой площадке активирована!"
     elif prize == "custom_card":
         set_config("custom_card_prize_claimed", "1")
-        prize_text = "🎨 **Уникальный приз: создание своей карты с рейтингом 82!** Свяжитесь с администратором @admin для создания.\n\n⚠️ Это единственная карта такого рода — больше в колесе удачи она не выпадет никому."
+        prize_text = "🎨 **Уникальный приз: создание своей карты с рейтингом 82!** Свяжитесь с администратором.\n\n⚠️ Это единственная карта такого рода — больше в колесе удачи она не выпадет никому."
     elif prize == "rare":
         c.execute("SELECT * FROM cards WHERE rarity = 'Редкая'")
         cds = c.fetchall()
@@ -883,6 +938,95 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎡 **Колесо удачи прокручено!**\n\n{prize_text}",
         parse_mode="Markdown"
     )
+
+# ---------- МИНИ-ИГРА ОРЕЛ И РЕШКА (/coinflip) ----------
+async def coin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+    await update.message.reply_text("🪙 **Мини-игра: Орёл и Решка**\nШанс на победу: **20%**, на проигрыш: **80%**.\nПри победе ставка умножается на **x4.5**!\n\nВведите ставку в RPLCoin (целое число):", reply_markup=bet_cancel_keyboard(), parse_mode="Markdown")
+    return WAITING_COIN_BET
+
+async def coin_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        bet = int(update.message.text.strip())
+        if bet <= 0:
+            await update.message.reply_text("❌ Ставка должна быть больше 0!", reply_markup=bet_cancel_keyboard())
+            return WAITING_COIN_BET
+
+        user = update.effective_user
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE user_id = %s", (user.id,))
+        u_bal = c.fetchone()['balance']
+        conn.close()
+
+        if bet > u_bal:
+            await update.message.reply_text(f"❌ Недостаточно средств! Ваш баланс: {u_bal} RPLCoin.", reply_markup=bet_cancel_keyboard())
+            return WAITING_COIN_BET
+
+        context.user_data["coin_bet"] = bet
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🪙 Орёл", callback_data="coin_heads"),
+             InlineKeyboardButton("🦅 Решка", callback_data="coin_tails")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="cancel_minigame")]
+        ])
+        await update.message.reply_text(f"✅ Ставка принята: **{bet} RPLCoin**.\nВыберите сторону монеты:", reply_markup=kb, parse_mode="Markdown")
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("❌ Введите ставку числом!", reply_markup=bet_cancel_keyboard())
+        return WAITING_COIN_BET
+
+async def coin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    data = query.data
+
+    if not data.startswith("coin_"):
+        return
+
+    await query.answer()
+    player_choice = data.replace("coin_", "")
+    bet = context.user_data.get("coin_bet", 100)
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id = %s", (user.id,))
+    u_bal = c.fetchone()['balance']
+
+    if bet > u_bal:
+        conn.close()
+        await query.message.edit_text("❌ Ошибка: недостаточно средств для выплаты ставки.")
+        return
+
+    # Шансы: 20% выигрыш, 80% проигрыш
+    r = random.random()
+    if r < 0.20:
+        flip_result = player_choice
+        won = True
+    else:
+        flip_result = "tails" if player_choice == "heads" else "heads"
+        won = False
+
+    sides = {"heads": "🪙 Орёл", "tails": "🦅 Решка"}
+
+    if won:
+        win_amount = int(bet * 4.5)
+        c.execute("UPDATE users SET balance = balance - %s + %s WHERE user_id = %s", (bet, win_amount, user.id))
+        res_str = f"🎉 **ПОБЕДА!** Вы угадали! Вы выиграли **{win_amount} RPLCoin** (x4.5)!"
+    else:
+        c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (bet, user.id))
+        res_str = f"❌ **ПОРАЖЕНИЕ!** Монета упала другой стороной. Вы потеряли **{bet} RPLCoin**."
+
+    conn.commit()
+    conn.close()
+
+    text = (
+        f"🪙 **Результат ОРЛА и РЕШКИ:**\n\n"
+        f"👤 Ваш выбор: {sides[player_choice]}\n"
+        f"🎲 Выпало: {sides[flip_result]}\n\n"
+        f"{res_str}"
+    )
+    await query.message.edit_text(text, parse_mode="Markdown")
 
 # ---------- МИНИ-ИГРА КАМЕНЬ-НОЖНИЦЫ-БУМАГА (/rps) ----------
 async def rps_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -944,7 +1088,6 @@ async def rps_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.edit_text("❌ Ошибка: недостаточно средств для выплаты ставки.")
         return
 
-    # Защищенная логика шансов с псевдорандомом и смещением
     rand_val = random.random()
     if rand_val < 0.42:
         if player_choice == "rock": bot_choice = "scissors"
@@ -1017,9 +1160,6 @@ async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(2)
 
         symbols = ["🏒", "🥅", "⭐", "🍒", "7️⃣", "💎"]
-
-        # Шансы слотов: суммарный шанс выигрыша ровно 25%
-        # 3% джекпот (x10) + 7% крупный приз (x5) + 15% малый приз (x2) = 25% побед, 75% проигрыш
         r = random.random()
         if r < 0.03:
             sym = random.choice(["7️⃣", "💎", "⭐"])
@@ -1036,7 +1176,6 @@ async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             random.shuffle(line)
             mult = 2
         else:
-            # Гарантированный проигрыш: три РАЗНЫХ символа, чтобы не было случайных совпадений
             while True:
                 line = random.choices(symbols, k=3)
                 if len(set(line)) == 3:
@@ -1096,7 +1235,6 @@ async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await update.message.reply_text("🎲 Бот готовится к броску...", parse_mode="Markdown")
         await asyncio.sleep(2)
 
-        # Шансы костей: победа ровно 25%, ничья 20%, поражение 55%
         r = random.random()
         if r < 0.25:
             bot_val = random.randint(1, 4)
@@ -1301,11 +1439,9 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 В базе пока нет карточек! Администратор скоро их добавит.")
         return
 
-    # Бесплатная карта никогда не должна дублировать уже имеющуюся у игрока карту
     card = choose_new_card_strict(c, user.id, cards)
 
     if not card:
-        # В этой редкости у игрока уже есть все карты — расширяем пул на все редкости
         c.execute('''
             SELECT c.*, col.name as collection_name, t.name as team_name, t.emoji as team_emoji
             FROM cards c
@@ -1317,11 +1453,10 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         card = choose_new_card_strict(c, user.id, all_non_secret)
 
     if not card:
-        # У игрока уже есть абсолютно все доступные карточки — выдаём компенсацию, а не дубль
         if bypassed:
             c.execute("UPDATE users SET free_card_cooldown_reset_until = NULL, balance = balance + 3000 WHERE user_id = %s", (user.id,))
         else:
-            c.execute("UPDATE users SET last_card_claim = %s, balance = balance + 3000 WHERE user_id = %s", (now, user.id))
+            c.execute("UPDATE users SET last_card_claim = %s, card_cd_notified = FALSE, balance = balance + 3000 WHERE user_id = %s", (now, user.id))
         conn.commit()
         conn.close()
         await update.message.reply_text(
@@ -1340,7 +1475,7 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if bypassed:
         c.execute("UPDATE users SET free_card_cooldown_reset_until = NULL WHERE user_id = %s", (user.id,))
     else:
-        c.execute("UPDATE users SET last_card_claim = %s WHERE user_id = %s", (now, user.id))
+        c.execute("UPDATE users SET last_card_claim = %s, card_cd_notified = FALSE WHERE user_id = %s", (now, user.id))
         
     conn.commit()
     conn.close()
@@ -1759,15 +1894,21 @@ async def market_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("❌ Вы не можете купить собственный лот!", show_alert=True)
             return
 
-        c.execute("SELECT balance FROM users WHERE user_id = %s", (user.id,))
-        buyer_bal = c.fetchone()['balance']
+        c.execute("SELECT balance, discount_percent FROM users WHERE user_id = %s", (user.id,))
+        u_row = c.fetchone()
+        buyer_bal = u_row['balance']
+        disc = u_row['discount_percent']
 
-        if buyer_bal < item['price']:
+        final_price = item['price']
+        if disc > 0:
+            final_price = int(item['price'] * (100 - disc) / 100)
+
+        if buyer_bal < final_price:
             conn.close()
-            await query.answer("❌ Недостаточно RPLCoin для покупки!", show_alert=True)
+            await query.answer(f"❌ Недостаточно RPLCoin для покупки! (Цена со скидкой: {final_price})", show_alert=True)
             return
 
-        c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (item['price'], user.id))
+        c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (final_price, user.id))
         c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (item['price'], item['seller_id']))
 
         c.execute('''
@@ -1785,7 +1926,8 @@ async def market_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             pass
 
-        await query.answer("🎉 Вы успешно купили карточку с рынка!", show_alert=True)
+        disc_str = f" (применена скидка {disc}%)" if disc > 0 else ""
+        await query.answer(f"🎉 Вы успешно купили карточку с рынка{disc_str}!", show_alert=True)
         await show_market(update, context)
 
 async def execute_market_list_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1838,7 +1980,7 @@ async def execute_market_list_price(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("❌ Введите цену целым числом (до 999 999):")
         return WAITING_MARKET_PRICE_INPUT
 
-# ---------- СИСТЕМА ТРЕЙДА (/trade) ----------
+# ---------- СИСТЕМА ТРЕЙДА (/trade) И /tradecancel ----------
 active_trades = {}
 
 async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1879,6 +2021,12 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Один из игроков уже находится в активном трейде!")
             return
 
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO pending_trades (sender_id, target_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user.id, target_id))
+    conn.commit()
+    conn.close()
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Принять Трейд", callback_data=f"accept_trade_{user.id}_{target_id}")],
         [InlineKeyboardButton("❌ Отклонить", callback_data=f"decline_trade_{user.id}_{target_id}")]
@@ -1896,7 +2044,61 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("❌ Не удалось отправить уведомление игроку (возможно, бот заблокирован им).")
 
-async def render_trade_text(tdata, for_user_id):
+async def tradecancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
+    user_id = update.effective_user.id
+    cancelled = []
+
+    for trade_id, trade in list(active_trades.items()):
+        if user_id not in (trade['p1'], trade['p2']):
+            continue
+
+        other_id = trade['p2'] if user_id == trade['p1'] else trade['p1']
+        messages = trade.get('msgs', {}).copy()
+
+        del active_trades[trade_id]
+        cancelled.append(trade_id)
+
+        for chat_id, message_id in messages.items():
+            if not message_id:
+                continue
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="🚫 Трейд отменён одной из сторон.",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+        try:
+            await context.bot.send_message(chat_id=other_id, text="🚫 Игрок отменил активный трейд.")
+        except Exception:
+            pass
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM pending_trades WHERE sender_id = %s OR target_id = %s RETURNING sender_id, target_id", (user_id, user_id))
+    pending = c.fetchall()
+    conn.commit()
+    conn.close()
+
+    for row in pending:
+        other_id = row['target_id'] if row['sender_id'] == user_id else row['sender_id']
+        try:
+            await context.bot.send_message(chat_id=other_id, text="🚫 Предложение трейда отменено.")
+        except Exception:
+            pass
+
+    if cancelled or pending:
+        await update.message.reply_text("✅ Все ваши активные трейды и запросы успешно отменены.")
+    else:
+        await update.message.reply_text("ℹ️ У вас нет активных трейдов или исходящих предложений.")
+
+async def render_trade_text(tdata):
     conn = get_db()
     c = conn.cursor()
 
@@ -1951,21 +2153,21 @@ async def update_trade_views(context, trade_id):
     p1, p2 = tdata['p1'], tdata['p2']
     m1, m2 = tdata['msgs'].get(p1), tdata['msgs'].get(p2)
 
-    txt = await render_trade_text(tdata, p1)
+    txt = await render_trade_text(tdata)
 
-    p1_ready_btn = InlineKeyboardButton("❌ Снять готовность" if tdata['p1_ready'] else "✅ ПОДТВЕРДИТЬ ГОТОВНОСТЬ", callback_data=f"tr_ready_{trade_id}")
+    p1_ready_text = "❌ Снять готовность" if tdata['p1_ready'] else "✅ ПОДТВЕРДИТЬ ГОТОВНОСТЬ"
     kb1 = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить карту", callback_data=f"tr_addcard_{trade_id}"), InlineKeyboardButton("💵 Изменить RPLCoin", callback_data=f"tr_addmoney_{trade_id}")],
         [InlineKeyboardButton("🗑 Очистить предложение", callback_data=f"tr_clear_{trade_id}")],
-        [p1_ready_btn],
+        [InlineKeyboardButton(p1_ready_text, callback_data=f"tr_ready_{trade_id}")],
         [InlineKeyboardButton("🚫 Отменить Трейд", callback_data=f"tr_cancel_{trade_id}")]
     ])
 
-    p2_ready_btn = InlineKeyboardButton("❌ Снять готовность" if tdata['p2_ready'] else "✅ ПОДТВЕРДИТЬ ГОТОВНОСТЬ", callback_data=f"tr_ready_{trade_id}")
+    p2_ready_text = "❌ Снять готовность" if tdata['p2_ready'] else "✅ ПОДТВЕРДИТЬ ГОТОВНОСТЬ"
     kb2 = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить карту", callback_data=f"tr_addcard_{trade_id}"), InlineKeyboardButton("💵 Изменить RPLCoin", callback_data=f"tr_addmoney_{trade_id}")],
         [InlineKeyboardButton("🗑 Очистить предложение", callback_data=f"tr_clear_{trade_id}")],
-        [p2_ready_btn],
+        [InlineKeyboardButton(p2_ready_text, callback_data=f"tr_ready_{trade_id}")],
         [InlineKeyboardButton("🚫 Отменить Трейд", callback_data=f"tr_cancel_{trade_id}")]
     ])
 
@@ -1986,6 +2188,7 @@ async def trade_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     data = query.data
 
     if data.startswith("accept_trade_"):
+        await query.answer()
         parts = data.split("_")
         p1 = int(parts[2])
         p2 = int(parts[3])
@@ -1993,6 +2196,12 @@ async def trade_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         if user.id != p2:
             await query.answer("❌ Этот запрос отправлен не вам!", show_alert=True)
             return
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("DELETE FROM pending_trades WHERE sender_id = %s AND target_id = %s", (p1, p2))
+        conn.commit()
+        conn.close()
 
         trade_id = f"{p1}_{p2}_{int(time.time())}"
         active_trades[trade_id] = {
@@ -2012,15 +2221,22 @@ async def trade_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await update_trade_views(context, trade_id)
 
     elif data.startswith("decline_trade_"):
+        await query.answer()
         parts = data.split("_")
         p1 = int(parts[2])
         await query.edit_message_text("❌ Предложение трейда отклонено.")
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("DELETE FROM pending_trades WHERE sender_id = %s AND target_id = %s", (p1, user.id))
+        conn.commit()
+        conn.close()
         try:
             await context.bot.send_message(chat_id=p1, text="❌ Игрок отклонил ваше предложение обмена.")
         except Exception:
             pass
 
     elif data.startswith("tr_"):
+        await query.answer()
         parts = data.split("_")
         action = parts[1]
         trade_id = "_".join(parts[2:])
@@ -2055,7 +2271,6 @@ async def trade_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             
             tdata['p1_ready'] = False
             tdata['p2_ready'] = False
-            await query.answer("Предложение очищено!")
             await update_trade_views(context, trade_id)
 
         elif action == "addmoney":
@@ -2145,6 +2360,34 @@ async def execute_trade_finish(context, trade_id):
             except Exception:
                 pass
         return
+
+    # Проверка наличия карт у p1
+    for cid in set(c1):
+        needed_cnt = c1.count(cid)
+        c.execute("SELECT count FROM user_cards WHERE user_id = %s AND card_id = %s", (p1, cid))
+        row = c.fetchone()
+        if not row or row['count'] < needed_cnt:
+            conn.close()
+            for uid, mid in tdata['msgs'].items():
+                try:
+                    await context.bot.edit_message_text(chat_id=uid, message_id=mid, text="❌ **Ошибка трейда!** У первого игрока больше нет одной из выбранных карточек.")
+                except Exception:
+                    pass
+            return
+
+    # Проверка наличия карт у p2
+    for cid in set(c2):
+        needed_cnt = c2.count(cid)
+        c.execute("SELECT count FROM user_cards WHERE user_id = %s AND card_id = %s", (p2, cid))
+        row = c.fetchone()
+        if not row or row['count'] < needed_cnt:
+            conn.close()
+            for uid, mid in tdata['msgs'].items():
+                try:
+                    await context.bot.edit_message_text(chat_id=uid, message_id=mid, text="❌ **Ошибка трейда!** У второго игрока больше нет одной из выбранных карточек.")
+                except Exception:
+                    pass
+            return
 
     c.execute("UPDATE users SET balance = balance - %s + %s WHERE user_id = %s", (m1, m2, p1))
     c.execute("UPDATE users SET balance = balance - %s + %s WHERE user_id = %s", (m2, m1, p2))
@@ -2395,11 +2638,13 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     avg_ovr = round(total_ovr / 5, 1) if count_filled == 5 else 0
     best_skater_str = f"**{best_skater['nickname']}** ({best_skater['ovr']} OVR)" if best_skater else "Отсутствует"
     best_goalie_str = f"**{best_goalie['nickname']}** ({best_goalie['ovr']} OVR)" if best_goalie else "Отсутствует"
+    disc_info = f"🏷 Скидка в магазине/на рынке: **{u_data['discount_percent']}%**\n" if u_data['discount_percent'] > 0 else ""
 
     text = (
         f"🏒 **Профиль игрока {user.first_name}:**\n\n"
         f"💳 Баланс: **{u_data['balance']} RPLCoin**\n"
         f"🏆 Рейтинг MMR: **{u_data['mmr']}**\n"
+        f"{disc_info}"
         f"⭐ Средний OVR Состава: **{avg_ovr if avg_ovr > 0 else 'Состав не собран'}**\n\n"
         f"🏒 Лучший Skater: {best_skater_str}\n"
         f"🧤 Лучший Goalie: {best_goalie_str}\n\n"
@@ -2507,7 +2752,7 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await query.answer("✅ Карточка успешно установлена!")
         await show_profile(update, context)
 
-# ---------- МАТЧИ И ПОИСК СОПЕРНИКА (/cardmatch) С КНОПКОЙ ПОЛУЧЕНИЯ СТАРТОВОГО НАБОРА ----------
+# ---------- МАТЧИ И ПОИСК СОПЕРНИКА (/cardmatch) С УЛУЧШЕННЫМ ИИ И СИТУАЦИЯМИ ----------
 active_searches = {}
 active_games = set()
 
@@ -2765,14 +3010,17 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
         roster2_text = format_cards_list(p2_cards)
 
         header = (
-            f"🏒 **МАТЧ НАЧАЛСЯ!**\n"
-            f"🔴 **{name1}** ({p1_ovr:.1f} OVR) vs 🔵 **{name2}** ({p2_ovr:.1f} OVR)\n\n"
+            f"╔═══════════════════════════════╗\n"
+            f"  🏒 **RPL: ПРЯМАЯ ТРАНСЛЯЦИЯ МАТЧА** 🏒\n"
+            f"╚═══════════════════════════════╝\n\n"
+            f"🔴 **{name1}** (⭐ {p1_ovr:.1f} OVR)\n"
+            f"🔵 **{name2}** (⭐ {p2_ovr:.1f} OVR)\n\n"
             f"📋 **Состав {name1}:**\n{roster1_text}\n\n"
             f"📋 **Состав {name2}:**\n{roster2_text}\n\n"
-            f"────────────────────\n"
+            f"───────────────────────────────\n"
         )
 
-        await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}⏱ **1-й Период стартует! Команды выходят на лед...**")
+        await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}⏱ **1-й Период стартует! Арбитр вбрасывает шайбу...**")
         await asyncio.sleep(4)
 
         score1, score2 = 0, 0
@@ -2784,7 +3032,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
         prob_p1, prob_p2 = calc_goal_probabilities(p1_cards, p2_cards)
 
         for period in range(1, 4):
-            period_header = f"⏱ **ПЕРИОД {period}**\n"
+            period_header = f"⏱ **ПЕРИОД {period} / 3**\n"
             
             for tick in range(1, 4):
                 minute = (period - 1) * 20 + tick * 6 + random.randint(-1, 2)
@@ -2801,8 +3049,8 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     c_g.execute("UPDATE users SET balance = balance + 100 WHERE user_id = %s", (p1_id,))
                     conn_g.commit()
 
-                    assist_str = f" (пас: {assist['nickname']})" if assist else ""
-                    evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']}{assist_str} забивает за🔴 {name1}! (+100 RPLCoin) [{score1}:{score2}]"
+                    assist_str = f" (ассистент: {assist['nickname']})" if assist else ""
+                    evt = f"🚨 **{minute}' ГОЛ!** {scorer['nickname']}{assist_str} мощным броском открывает счет за 🔴 {name1}! (+100 RPLCoin) [📊 {score1}:{score2}]"
                     all_events.append(evt)
 
                 elif rand_val < prob_p1 + prob_p2:
@@ -2814,35 +3062,56 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     c_g.execute("UPDATE users SET balance = balance + 100 WHERE user_id = %s", (p2_id,))
                     conn_g.commit()
 
-                    assist_str = f" (пас: {assist['nickname']})" if assist else ""
-                    evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']}{assist_str} забивает за🔵 {name2}! (+100 RPLCoin) [{score1}:{score2}]"
+                    assist_str = f" (ассистент: {assist['nickname']})" if assist else ""
+                    evt = f"🚨 **{minute}' ГОЛ!** {scorer['nickname']}{assist_str} поражает ворота 🔵 {name2}! (+100 RPLCoin) [📊 {score1}:{score2}]"
                     all_events.append(evt)
 
                 else:
-                    event_type = random.choice(["save1", "save2", "post", "hit", "penalty"])
+                    event_type = random.choice([
+                        "save1", "save2", "post", "hit", "penalty", 
+                        "var_cancel", "broken_stick", "breakaway", 
+                        "powerplay", "timeout", "fight", "double_save"
+                    ])
+                    
                     if event_type == "save1":
-                        evt = f"🧤 **{minute}' СЕЙВ!** Вратарь {p1_cards['goalie']['nickname']} уверенно забирает шайбу!"
+                        evt = f"🧤 **{minute}' СЕЙВ!** Голкипер {p1_cards['goalie']['nickname']} в шпагате парирует коварный бросок!"
                     elif event_type == "save2":
-                        evt = f"🧤 **{minute}' СЕЙВ!** Вратарь {p2_cards['goalie']['nickname']} отражает сильнейший бросок!"
+                        evt = f"🧤 **{minute}' СЕЙВ!** Вратарь {p2_cards['goalie']['nickname']} ловушкой намертво забирает шайбу!"
                     elif event_type == "post":
                         sk = random.choice([p1_cards['skater1'], p2_cards['skater1']])
-                        evt = f"🏒 **{minute}' ШТАНГА!** {sk['nickname']} наносит мощный щелчок, но шайба попадает в каркас!"
+                        evt = f"🏒 **{minute}' ШТАНГА!** Снаряд после броска {sk['nickname']} со звонком ударяется о каркас ворот!"
                     elif event_type == "hit":
                         sk1 = random.choice([p1_cards['skater1'], p1_cards['skater2']])
                         sk2 = random.choice([p2_cards['skater1'], p2_cards['skater2']])
-                        evt = f"💥 **{minute}' СИЛОВОЙ ПРИЕМ!** {sk1['nickname']} жестко встретил {sk2['nickname']} у борта!"
-                    else:
+                        evt = f"💥 **{minute}' СИЛОВОЙ ПРИЕМ!** {sk1['nickname']} проводит сокрушительный хит против {sk2['nickname']} у борта!"
+                    elif event_type == "penalty":
                         sk = random.choice([p1_cards['skater3'], p2_cards['skater3']])
-                        evt = f"2️⃣ **{minute}' УДАЛЕНИЕ!** {sk['nickname']} получает 2 минуты малого штрафа."
+                        evt = f"2️⃣ **{minute}' УДАЛЕНИЕ!** {sk['nickname']} отправляется на скамейку штрафников за задержку клюшкой."
+                    elif event_type == "var_cancel":
+                        evt = f"📺 **{minute}' ВИДЕОПРОСМОТР (VAR):** Главный судья изучает повтор. Гол отменен из-за блокировки вратаря!"
+                    elif event_type == "broken_stick":
+                        sk = random.choice([p1_cards['skater2'], p2_cards['skater4']])
+                        evt = f"🪵 **{minute}' ПОЛОМКА КЛЮШКИ!** У {sk['nickname']} ломается клюшка в самый ответственный момент атаки!"
+                    elif event_type == "breakaway":
+                        sk = random.choice([p1_cards['skater1'], p2_cards['skater2']])
+                        evt = f"⚡️ **{minute}' ВЫХОД 1 НА 1!** {sk['nickname']} убегает на свидание с вратарем, но голкипер на высоте!"
+                    elif event_type == "powerplay":
+                        evt = f"📈 **{minute}' ОТИГРЫШ В БОЛЬШИНСТВЕ:** Команда идет в позиционную атаку, создавая огромную панику у ворот."
+                    elif event_type == "timeout":
+                        evt = f"⏱ **{minute}' МИНУТНЫЙ ПЕРЕРЫВ (ТАЙМ-АУТ):** Тренерский штаб проводит эмоциональную беседу с игроками на скамейке."
+                    elif event_type == "fight":
+                        evt = f"🥊 **{minute}' СТЫЧКА У ВОРОТ!** На пятачке вспыхивает массовая потасовка, арбитрам приходится разнимать игроков!"
+                    else:
+                        evt = f"🔥 **{minute}' СУПЕР-СЕЙВ!** Двойное спасение воротах! Голкипер успевает подняться и заблокировать добивание!"
 
                     all_events.append(evt)
 
                 recent_events = "\n".join(all_events[-6:])
                 status_text = (
                     f"{header}\n"
-                    f"📊 **Текущий Счет:** 🔴 {score1} — {score2} 🔵\n"
+                    f"📊 **Счет матча:** 🔴 {score1} — {score2} 🔵\n"
                     f"{period_header}\n"
-                    f"📝 **Ход матча:**\n{recent_events}"
+                    f"📝 **Хроника событий:**\n{recent_events}"
                 )
                 await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, status_text)
                 await asyncio.sleep(3.5)
@@ -2854,7 +3123,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
             conn_ot = get_db()
             c_ot = conn_ot.cursor()
             
-            evt_ot_start = "⏳ **ОСНОВНОЕ ВРЕМЯ ЗАВЕРШЕНО СО СЧЕТОМ " + f"{score1}:{score2}! Начинается ОВЕРТАЙМ (5 минут, 3х3)!**"
+            evt_ot_start = f"⏳ **ОСНОВНОЕ ВРЕМЯ ЗАВЕРШЕНО ({score1}:{score2})! НАЧИНАЕТСЯ ОВЕРТАЙМ (3 на 3 до золотого гола)!**"
             all_events.append(evt_ot_start)
             await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🔵\n\n{evt_ot_start}")
             await asyncio.sleep(4)
@@ -2870,7 +3139,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     score1 += 1
                     c_ot.execute("UPDATE users SET balance = balance + 100 WHERE user_id = %s", (p1_id,))
                     conn_ot.commit()
-                    evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🔴 {name1}! (+100 RPLCoin) [{score1}:{score2}]"
+                    evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🔴 {name1}! (+100 RPLCoin) [📊 {score1}:{score2}]"
                     all_events.append(evt)
                     break
                 elif rand_val < ot_prob1 + ot_prob2:
@@ -2878,11 +3147,11 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     score2 += 1
                     c_ot.execute("UPDATE users SET balance = balance + 100 WHERE user_id = %s", (p2_id,))
                     conn_ot.commit()
-                    evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🔵 {name2}! (+100 RPLCoin) [{score1}:{score2}]"
+                    evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🔵 {name2}! (+100 RPLCoin) [📊 {score1}:{score2}]"
                     all_events.append(evt)
                     break
                 else:
-                    evt = f"⚡️ **{ot_min}' ОПАСНЕЙШИЙ МОМЕНТ В ОВЕРТАЙМЕ!**"
+                    evt = f"⚡️ **{ot_min}' ОПАСНЕЙШИЙ МОМЕНТ В ОВЕРТАЙМЕ!** Шайба прокатывается рядом со штангой!"
                     all_events.append(evt)
 
                 recent_events = "\n".join(all_events[-6:])
@@ -2890,7 +3159,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     f"{header}\n"
                     f"📊 **Счет:** 🔴 {score1} — {score2} 🔵\n"
                     f"⏱ **ОВЕРТАЙМ (3х3)**\n"
-                    f"📝 **Ход матча:**\n{recent_events}"
+                    f"📝 **Хроника:**\n{recent_events}"
                 )
                 await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, status_text)
                 await asyncio.sleep(3.5)
@@ -2902,13 +3171,12 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
             conn_so = get_db()
             c_so = conn_so.cursor()
             
-            evt_so_start = "🏒 **СЕРИЯ ПОСЛЕМАТЧЕВЫХ БУЛЛИТОВ!**"
+            evt_so_start = "🏒 **НИЧЬЯ СОХРАНИЛАСЬ! НАЧИНАЕТСЯ СЕРИЯ ПОСЛЕМАТЧЕВЫХ БУЛЛИТОВ!**"
             all_events.append(evt_so_start)
             await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🔵\n\n{evt_so_start}")
             await asyncio.sleep(4)
 
-            so_score1 = 0
-            so_score2 = 0
+            so_score1, so_score2 = 0, 0
 
             for round_num in range(1, 4):
                 sk1 = random.choice([p1_cards['skater1'], p1_cards['skater2'], p1_cards['skater3'], p1_cards['skater4']])
@@ -2918,9 +3186,9 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     score1 += 1
                     c_so.execute("UPDATE users SET balance = balance + 100 WHERE user_id = %s", (p1_id,))
                     conn_so.commit()
-                    evt1 = f"🎯 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} — **ГОЛ!** (+100 RPLCoin) [{score1}:{score2}]"
+                    evt1 = f"🎯 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} исполняет изящный финт и забивает — **ГОЛ!** (+100 RPL) [📊 {score1}:{score2}]"
                 else:
-                    evt1 = f"🚫 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} — **СЕЙВ!** [{score1}:{score2}]"
+                    evt1 = f"🚫 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} бросает верхом, но вратарь парирует — **СЕЙВ!** [📊 {score1}:{score2}]"
                 
                 all_events.append(evt1)
 
@@ -2931,9 +3199,9 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     score2 += 1
                     c_so.execute("UPDATE users SET balance = balance + 100 WHERE user_id = %s", (p2_id,))
                     conn_so.commit()
-                    evt2 = f"🎯 **Буллит #{round_num} 🔵 {name2}**: {sk2['nickname']} — **ГОЛ!** (+100 RPLCoin) [{score1}:{score2}]"
+                    evt2 = f"🎯 **Буллит #{round_num} 🔵 {name2}**: {sk2['nickname']} бросает в «девятку» — **ГОЛ!** (+100 RPL) [📊 {score1}:{score2}]"
                 else:
-                    evt2 = f"🚫 **Буллит #{round_num} 🔵 {name2}**: {sk2['nickname']} — **СЕЙВ!** [{score1}:{score2}]"
+                    evt2 = f"🚫 **Буллит #{round_num} 🔵 {name2}**: {sk2['nickname']} обыгрывает, но щиток вратаря спасает — **СЕЙВ!** [📊 {score1}:{score2}]"
 
                 all_events.append(evt2)
                 recent_events = "\n".join(all_events[-6:])
@@ -2947,27 +3215,27 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
         c = conn.cursor()
 
         if score1 > score2:
-            res_text = f"🎉 **ПОБЕДА 🔴 {name1}!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p1_id, is_win=True)
-            apply_match_rewards(c, p2_id, is_win=False)
+            res_text = f"🎉 **ПОБЕДА КОМАНДЫ 🔴 {name1}!**\nИтоговый счет: **{score1} - {score2}**"
+            apply_match_rewards(c, p1_id, is_win=True, goals_for=score1, goals_against=score2)
+            apply_match_rewards(c, p2_id, is_win=False, goals_for=score2, goals_against=score1)
         elif score2 > score1:
-            res_text = f"🎉 **ПОБЕДА 🔵 {name2}!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p2_id, is_win=True)
-            apply_match_rewards(c, p1_id, is_win=False)
+            res_text = f"🎉 **ПОБЕДА КОМАНДЫ 🔵 {name2}!**\nИтоговый счет: **{score1} - {score2}**"
+            apply_match_rewards(c, p2_id, is_win=True, goals_for=score2, goals_against=score1)
+            apply_match_rewards(c, p1_id, is_win=False, goals_for=score1, goals_against=score2)
         else:
-            res_text = f"🤝 **НИЧЬЯ!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p1_id, is_win=None)
-            apply_match_rewards(c, p2_id, is_win=None)
+            res_text = f"🤝 **БОЕВАЯ НИЧЬЯ!**\nИтоговый счет: **{score1} - {score2}**"
+            apply_match_rewards(c, p1_id, is_win=None, goals_for=score1, goals_against=score2)
+            apply_match_rewards(c, p2_id, is_win=None, goals_for=score2, goals_against=score1)
 
         conn.commit()
         conn.close()
 
         final_text = (
-            f"🏁 **МАТЧ ЗАВЕРШЕН!**\n\n"
+            f"🏁 **МАТЧ ОКОНЧЕН! СТАТИСТИКА И ПРОТОКОЛ:**\n\n"
             f"{res_text}\n\n"
-            f"🏆 Победитель получил: **+50 MMR** и **+2000 RPLCoin**\n"
-            f"🥈 Проигравший получил: **-50 MMR** и **+500 RPLCoin**\n"
-            f"🪙 **За каждый забитый гол игрокам начислено по 100 RPLCoin!**\n\n"
+            f"🏆 Победитель: **+50 MMR** и **+2000 RPLCoin**\n"
+            f"🥈 Проигравший: **-50 MMR** и **+500 RPLCoin**\n"
+            f"🪙 **За каждый гол начислено по +100 RPLCoin!**\n\n"
             f"📋 **Полный протокол игры:**\n" + "\n".join(all_events)
         )
 
@@ -2990,14 +3258,15 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
         p1_cards = get_roster_cards(c, r1)
         
         p1_ovr = sum(cd['ovr'] for cd in p1_cards.values()) / 5.0
-
         p1_card_ids = [cd['id'] for cd in p1_cards.values()]
-        c.execute("SELECT * FROM cards WHERE id NOT IN %s AND ovr BETWEEN %s AND %s", 
-                  (tuple(p1_card_ids), max(50, int(p1_ovr - 5)), int(p1_ovr + 5)))
+
+        # ИИ бот выбирает уникальные карточки, не повторяющиеся и не совпадающие с картами игрока
+        c.execute("SELECT * FROM cards WHERE id NOT IN %s AND ovr BETWEEN %s AND %s ORDER BY RANDOM()", 
+                  (tuple(p1_card_ids), max(50, int(p1_ovr - 6)), int(p1_ovr + 6)))
         ai_candidates = c.fetchall()
 
-        if not ai_candidates:
-            c.execute("SELECT * FROM cards WHERE id NOT IN %s", (tuple(p1_card_ids),))
+        if len(ai_candidates) < 5:
+            c.execute("SELECT * FROM cards WHERE id NOT IN %s ORDER BY RANDOM()", (tuple(p1_card_ids),))
             ai_candidates = c.fetchall()
 
         conn.close()
@@ -3005,22 +3274,24 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
         ai_skaters = [cd for cd in ai_candidates if cd['position'] == 'Skater']
         ai_goalies = [cd for cd in ai_candidates if cd['position'] == 'Goalie']
 
-        if not ai_skaters or not ai_goalies:
-            ai_cards = {
-                "goalie": {"id": -1, "nickname": "AI Вратарь", "ovr": int(p1_ovr)},
-                "skater1": {"id": -2, "nickname": "AI Форвард #1", "ovr": int(p1_ovr)},
-                "skater2": {"id": -3, "nickname": "AI Форвард #2", "ovr": int(p1_ovr)},
-                "skater3": {"id": -4, "nickname": "AI Защитник #1", "ovr": int(p1_ovr)},
-                "skater4": {"id": -5, "nickname": "AI Защитник #2", "ovr": int(p1_ovr)}
-            }
-        else:
-            ai_cards = {
-                "goalie": random.choice(ai_goalies),
-                "skater1": random.choice(ai_skaters),
-                "skater2": random.choice(ai_skaters),
-                "skater3": random.choice(ai_skaters),
-                "skater4": random.choice(ai_skaters)
-            }
+        if not ai_goalies:
+            c_fallback = get_db()
+            cur_fb = c_fallback.cursor()
+            cur_fb.execute("SELECT * FROM cards WHERE position = 'Goalie' LIMIT 1")
+            ai_goalies = cur_fb.fetchall()
+            c_fallback.close()
+
+        selected_ai_skaters = random.sample(ai_skaters, min(4, len(ai_skaters))) if len(ai_skaters) >= 4 else ai_skaters
+        while len(selected_ai_skaters) < 4 and ai_skaters:
+            selected_ai_skaters.append(random.choice(ai_skaters))
+
+        ai_cards = {
+            "goalie": random.choice(ai_goalies) if ai_goalies else {"id": -1, "nickname": "AI Вратарь", "ovr": int(p1_ovr)},
+            "skater1": selected_ai_skaters[0] if len(selected_ai_skaters) > 0 else {"id": -2, "nickname": "AI Форвард #1", "ovr": int(p1_ovr)},
+            "skater2": selected_ai_skaters[1] if len(selected_ai_skaters) > 1 else {"id": -3, "nickname": "AI Форвард #2", "ovr": int(p1_ovr)},
+            "skater3": selected_ai_skaters[2] if len(selected_ai_skaters) > 2 else {"id": -4, "nickname": "AI Защитник #1", "ovr": int(p1_ovr)},
+            "skater4": selected_ai_skaters[3] if len(selected_ai_skaters) > 3 else {"id": -5, "nickname": "AI Защитник #2", "ovr": int(p1_ovr)}
+        }
 
         ai_ovr = sum(cd['ovr'] for cd in ai_cards.values()) / 5.0
         name1 = u1['first_name'] or u1['username'] or str(p1_id)
@@ -3029,14 +3300,17 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
         roster2_text = format_cards_list(ai_cards)
 
         header = (
-            f"🏒 **МАТЧ ПРОТИВ ИИ БОТА НАЧАЛСЯ!**\n"
-            f"🔴 **{name1}** ({p1_ovr:.1f} OVR) vs 🤖 **ИИ Бот** ({ai_ovr:.1f} OVR)\n\n"
+            f"╔═══════════════════════════════╗\n"
+            f"  🏒 **RPL: МАТЧ ПРОТИВ ИИ БОТА** 🏒\n"
+            f"╚═══════════════════════════════╝\n\n"
+            f"🔴 **{name1}** (⭐ {p1_ovr:.1f} OVR)\n"
+            f"🤖 **ИИ Бот (Сборная RPL)** (⭐ {ai_ovr:.1f} OVR)\n\n"
             f"📋 **Состав {name1}:**\n{roster1_text}\n\n"
             f"📋 **Состав ИИ Бота:**\n{roster2_text}\n\n"
-            f"────────────────────\n"
+            f"───────────────────────────────\n"
         )
 
-        await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}⏱ **1-й Период стартует! Команды выходят на лед...**")
+        await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}⏱ **1-й Период стартует! Арбитр вбрасывает шайбу...**")
         await asyncio.sleep(4)
 
         score1, score2 = 0, 0
@@ -3048,7 +3322,7 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
         prob_p1, prob_ai = calc_goal_probabilities(p1_cards, ai_cards)
 
         for period in range(1, 4):
-            period_header = f"⏱ **ПЕРИОД {period}**\n"
+            period_header = f"⏱ **ПЕРИОД {period} / 3**\n"
 
             for tick in range(1, 4):
                 minute = (period - 1) * 20 + tick * 6 + random.randint(-1, 2)
@@ -3060,36 +3334,42 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
                     scorer = random.choice([p1_cards['skater1'], p1_cards['skater2'], p1_cards['skater3'], p1_cards['skater4']])
                     score1 += 1
                     c_ai.execute("UPDATE users SET balance = balance + 100 WHERE user_id = %s", (p1_id,))
-                    conn_ai.commit()
+                    c_ai.commit()
 
-                    evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']} забивает за🔴 {name1}! (+100 RPLCoin) [{score1}:{score2}]"
+                    evt = f"🚨 **{minute}' ГОЛ!** {scorer['nickname']} забивает за 🔴 {name1}! (+100 RPLCoin) [📊 {score1}:{score2}]"
                     all_events.append(evt)
 
                 elif rand_val < prob_p1 + prob_ai:
                     scorer = random.choice([ai_cards['skater1'], ai_cards['skater2'], ai_cards['skater3'], ai_cards['skater4']])
                     score2 += 1
-                    evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']} (ИИ Бот) забивает за🤖 ИИ Бота! [{score1}:{score2}]"
+                    evt = f"🚨 **{minute}' ГОЛ!** {scorer['nickname']} мощно пробивает за 🤖 ИИ Бота! [📊 {score1}:{score2}]"
                     all_events.append(evt)
 
                 else:
-                    event_type = random.choice(["save1", "save2", "post", "hit"])
+                    event_type = random.choice(["save1", "save2", "post", "hit", "var_cancel", "broken_stick", "fight"])
                     if event_type == "save1":
-                        evt = f"🧤 **{minute}' СЕЙВ!** {p1_cards['goalie']['nickname']} забирает шайбу!"
+                        evt = f"🧤 **{minute}' СЕЙВ!** {p1_cards['goalie']['nickname']} забирает шайбу в ловушку!"
                     elif event_type == "save2":
-                        evt = f"🧤 **{minute}' СЕЙВ!** ИИ Вратарь отражает опасный бросок!"
+                        evt = f"🧤 **{minute}' СЕЙВ!** ИИ Вратарь парирует бросок в упор!"
                     elif event_type == "post":
-                        evt = f"🏒 **{minute}' ШТАНГА!** Мощный щелчок сотрясает ворота!"
+                        evt = f"🏒 **{minute}' ШТАНГА!** Шайба после мощного броска звенит о штангу ворот!"
+                    elif event_type == "hit":
+                        evt = f"💥 **{minute}' СИЛОВОЙ ПРИЕМ!** Жесткое столкновение игроков у борта!"
+                    elif event_type == "var_cancel":
+                        evt = f"📺 **{minute}' ВИДЕОПРОСМОТР (VAR):** Судья отменяет взятие ворот из-за паса рукой."
+                    elif event_type == "broken_stick":
+                        evt = f"🪵 **{minute}' ПОЛОМКА КЛЮШКИ!** Игрок остается без клюшки в разгар атаки."
                     else:
-                        evt = f"💥 **{minute}' СИЛОВОЙ ПРИЕМ!** Игроки сошлись у борта!"
+                        evt = f"🥊 **{minute}' СТЫЧКА У ВОРОТ!** Напряжение на льду нарастает, судьи разнимают хоккеистов."
 
                     all_events.append(evt)
 
                 recent_events = "\n".join(all_events[-6:])
                 status_text = (
                     f"{header}\n"
-                    f"📊 **Текущий Счет:** 🔴 {score1} — {score2} 🤖\n"
+                    f"📊 **Счет матча:** 🔴 {score1} — {score2} 🤖\n"
                     f"{period_header}\n"
-                    f"📝 **Ход матча:**\n{recent_events}"
+                    f"📝 **Хроника событий:**\n{recent_events}"
                 )
                 await broadcast_match_text(context, chat_id, msg_id, None, None, status_text)
                 await asyncio.sleep(3.5)
@@ -3101,7 +3381,7 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
             conn_ot_ai = get_db()
             c_ot_ai = conn_ot_ai.cursor()
             
-            evt_ot_start = "⏳ **ОСНОВНОЕ ВРЕМЯ ЗАВЕРШЕНО СО СЧЕТОМ " + f"{score1}:{score2}! Начинается ОВЕРТАЙМ (5 минут, 3х3)!**"
+            evt_ot_start = f"⏳ **ОСНОВНОЕ ВРЕМЯ ЗАВЕРШЕНО ({score1}:{score2})! НАЧИНАЕТСЯ ОВЕРТАЙМ!**"
             all_events.append(evt_ot_start)
             await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🤖\n\n{evt_ot_start}")
             await asyncio.sleep(4)
@@ -3116,14 +3396,14 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
                     scorer = random.choice([p1_cards['skater1'], p1_cards['skater2']])
                     score1 += 1
                     c_ot_ai.execute("UPDATE users SET balance = balance + 100 WHERE user_id = %s", (p1_id,))
-                    conn_ot_ai.commit()
-                    evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🔴 {name1}! (+100 RPLCoin) [{score1}:{score2}]"
+                    c_ot_ai.commit()
+                    evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ!** {scorer['nickname']} приносит победу 🔴 {name1}! (+100 RPL) [📊 {score1}:{score2}]"
                     all_events.append(evt)
                     break
                 elif rand_val < ot_prob1 + ot_prob2:
                     scorer = random.choice([ai_cards['skater1'], ai_cards['skater2']])
                     score2 += 1
-                    evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🤖 ИИ Боту! [{score1}:{score2}]"
+                    evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ!** {scorer['nickname']} приносит победу 🤖 ИИ Боту! [📊 {score1}:{score2}]"
                     all_events.append(evt)
                     break
                 else:
@@ -3152,10 +3432,10 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
                     so_score1 += 1
                     score1 += 1
                     c_so_ai.execute("UPDATE users SET balance = balance + 100 WHERE user_id = %s", (p1_id,))
-                    conn_so_ai.commit()
-                    evt1 = f"🎯 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} — **ГОЛ!** (+100 RPLCoin) [{score1}:{score2}]"
+                    c_so_ai.commit()
+                    evt1 = f"🎯 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} забивает — **ГОЛ!** (+100 RPL) [📊 {score1}:{score2}]"
                 else:
-                    evt1 = f"🚫 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} — **СЕЙВ!** [{score1}:{score2}]"
+                    evt1 = f"🚫 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} — **СЕЙВ!** [📊 {score1}:{score2}]"
                 all_events.append(evt1)
 
                 sk2 = random.choice([ai_cards['skater1'], ai_cards['skater2'], ai_cards['skater3'], ai_cards['skater4']])
@@ -3163,9 +3443,9 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
                 if random.random() < ai_prob:
                     so_score2 += 1
                     score2 += 1
-                    evt2 = f"🎯 **Буллит #{round_num} 🤖 ИИ Бот**: {sk2['nickname']} — **ГОЛ!** [{score1}:{score2}]"
+                    evt2 = f"🎯 **Буллит #{round_num} 🤖 ИИ Бот**: {sk2['nickname']} — **ГОЛ!** [📊 {score1}:{score2}]"
                 else:
-                    evt2 = f"🚫 **Буллит #{round_num} 🤖 ИИ Бот**: {sk2['nickname']} — **СЕЙВ!** [{score1}:{score2}]"
+                    evt2 = f"🚫 **Буллит #{round_num} 🤖 ИИ Бот**: {sk2['nickname']} — **СЕЙВ!** [📊 {score1}:{score2}]"
                 all_events.append(evt2)
 
                 recent_events = "\n".join(all_events[-6:])
@@ -3180,13 +3460,13 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
 
         if score1 > score2:
             res_text = f"🎉 **ПОБЕДА НАД ИИ БОТОМ!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p1_id, is_win=True)
+            apply_match_rewards(c, p1_id, is_win=True, goals_for=score1, goals_against=score2)
         elif score2 > score1:
             res_text = f"❌ **ПОРАЖЕНИЕ ОТ ИИ БОТА!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p1_id, is_win=False)
+            apply_match_rewards(c, p1_id, is_win=False, goals_for=score1, goals_against=score2)
         else:
             res_text = f"🤝 **НИЧЬЯ С ИИ БОТОМ!**\nИтоговый счет: **{score1} - {score2}**"
-            apply_match_rewards(c, p1_id, is_win=None)
+            apply_match_rewards(c, p1_id, is_win=None, goals_for=score1, goals_against=score2)
 
         conn.commit()
         conn.close()
@@ -3194,7 +3474,7 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
         final_text = (
             f"🏁 **МАТЧ ЗАВЕРШЕН!**\n\n"
             f"{res_text}\n\n"
-            f"🪙 **За каждый забитый гол вам начислено по 100 RPLCoin!**\n\n"
+            f"🪙 **За каждый забитый гол вам начислено по +100 RPLCoin!**\n\n"
             f"📋 **Протокол игры:**\n" + "\n".join(all_events)
         )
 
@@ -3215,7 +3495,7 @@ def get_roster_cards(cursor, roster):
         "skater4": cds[roster['skater4_id']]
     }
 
-def apply_match_rewards(cursor, user_id, is_win):
+def apply_match_rewards(cursor, user_id, is_win, goals_for=0, goals_against=0):
     if is_win is True:
         cursor.execute("UPDATE users SET mmr = mmr + 50, balance = balance + 2000 WHERE user_id = %s", (user_id,))
     elif is_win is False:
@@ -3246,7 +3526,7 @@ async def cardmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ---------- МАГАЗИН И ПАКГИ С ОГРАНИЧЕНИЕМ ПО ВРЕМЕНИ ИЗ АДМИНКИ ----------
+# ---------- МАГАЗИН И ПАКГИ С УЧЕТОМ СКИДКИ ----------
 async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -3265,6 +3545,9 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute("SELECT * FROM packs WHERE available_until IS NULL OR available_until > %s", (now,))
     packs = c.fetchall()
 
+    c.execute("SELECT discount_percent FROM users WHERE user_id = %s", (user.id,))
+    u_disc = c.fetchone()['discount_percent']
+
     if not packs:
         conn.close()
         text = "🛒 **Магазин Паков пуст.** Администратор скоро добавит новые паки!"
@@ -3275,7 +3558,12 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text)
         return
 
-    text = "🛒 **МАГАЗИН ПАКОВ КАРТОЧЕК:**\n\nВыберите пак для предварительного просмотра и покупки:\n\n"
+    text = "🛒 **МАГАЗИН ПАКОВ КАРТОЧЕК:**\n"
+    if u_disc > 0:
+        text += f"🏷 **Активна скидка: {u_disc}% на все покупки!**\n\n"
+    else:
+        text += "\nВыберите пак для предварительного просмотра и покупки:\n\n"
+
     buttons = []
 
     for p in packs:
@@ -3290,8 +3578,14 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hours = int(diff.total_seconds() // 3600)
             time_left = f" (⏱ Осталось: {hours}ч)"
 
-        text += f"📦 **{p['name']}** — `{p['price']} RPLCoin` (Куплено: {lim_str}){time_left}\n"
-        buttons.append([InlineKeyboardButton(f"📦 {p['name']} ({p['price']} RPLCoin)", callback_data=f"preview_pack_{p['id']}")])
+        final_price = p['price']
+        price_str = f"**{final_price} RPLCoin**"
+        if u_disc > 0:
+            final_price = int(p['price'] * (100 - u_disc) / 100)
+            price_str = f"~~{p['price']}~~ **{final_price} RPLCoin** (-{u_disc}%)"
+
+        text += f"📦 **{p['name']}** — {price_str} (Куплено: {lim_str}){time_left}\n"
+        buttons.append([InlineKeyboardButton(f"📦 {p['name']} ({final_price} RPL)", callback_data=f"preview_pack_{p['id']}")])
 
     conn.close()
 
@@ -3322,6 +3616,9 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         c.execute("SELECT * FROM packs WHERE id = %s", (pack_id,))
         pack = c.fetchone()
 
+        c.execute("SELECT discount_percent FROM users WHERE user_id = %s", (user.id,))
+        u_disc = c.fetchone()['discount_percent']
+
         if not pack:
             conn.close()
             await query.answer("❌ Пак не найден!", show_alert=True)
@@ -3345,9 +3642,15 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         for pc in p_cards:
             cards_str += f"  • **{pc['nickname']}** ({pc['position']}, {pc['ovr']} OVR) [{pc['rarity']}]\n"
 
+        final_price = pack['price']
+        price_str = f"**{final_price} RPLCoin**"
+        if u_disc > 0:
+            final_price = int(pack['price'] * (100 - u_disc) / 100)
+            price_str = f"~~{pack['price']}~~ **{final_price} RPLCoin** (скидка {u_disc}%)"
+
         caption = (
             f"📦 **ПРЕДПРОСМОТР ПАКА «{pack['name']}»**\n\n"
-            f"💰 Цена: **{pack['price']} RPLCoin**\n"
+            f"💰 Цена: {price_str}\n"
             f"🔢 Лимит покупок: **{lim_str}**\n\n"
             f"🃏 **Возможные карточки в паке:**\n{cards_str or '  *(карточки не указаны)*'}\n"
             f"Подтвердите покупку ниже:"
@@ -3380,17 +3683,23 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         c.execute("SELECT * FROM packs WHERE id = %s", (pack_id,))
         pack = c.fetchone()
-        c.execute("SELECT balance FROM users WHERE user_id = %s", (user.id,))
-        u_bal = c.fetchone()['balance']
+        c.execute("SELECT balance, discount_percent FROM users WHERE user_id = %s", (user.id,))
+        u_row = c.fetchone()
+        u_bal = u_row['balance']
+        u_disc = u_row['discount_percent']
 
         if not pack:
             conn.close()
             await query.answer("❌ Пак не найден!", show_alert=True)
             return
 
-        if u_bal < pack['price']:
+        final_price = pack['price']
+        if u_disc > 0:
+            final_price = int(pack['price'] * (100 - u_disc) / 100)
+
+        if u_bal < final_price:
             conn.close()
-            await query.answer("❌ У вас недостаточно RPLCoin!", show_alert=True)
+            await query.answer(f"❌ У недостаточно RPLCoin! (Требуется {final_price})", show_alert=True)
             return
 
         c.execute("SELECT buy_count FROM user_pack_buys WHERE user_id = %s AND pack_id = %s", (user.id, pack_id))
@@ -3413,7 +3722,7 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         chosen_card = choose_card_for_user(c, user.id, p_cards)
         chosen_card_id = chosen_card['id']
 
-        c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (pack['price'], user.id))
+        c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (final_price, user.id))
         c.execute('''
             INSERT INTO user_pack_buys (user_id, pack_id, buy_count) VALUES (%s, %s, 1)
             ON CONFLICT (user_id, pack_id) DO UPDATE SET buy_count = user_pack_buys.buy_count + 1
@@ -3995,6 +4304,7 @@ async def minigames_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎮 Камень-Ножницы-Бумага", callback_data="play_rps")],
         [InlineKeyboardButton("🎰 Слоты", callback_data="play_slots")],
         [InlineKeyboardButton("🎲 Кости", callback_data="play_dice")],
+        [InlineKeyboardButton("🪙 Орёл и Решка", callback_data="play_coin")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main_inline")]
     ])
     await update.message.reply_text("🕹 **Выберите мини-игру:**", reply_markup=kb, parse_mode="Markdown")
@@ -4144,6 +4454,9 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "play_dice":
         await query.message.reply_text("🎲 **Игра в Кости**\nСначала бросает бот, затем бот бросает за вас!\nВведите ставку в RPLCoin (целое число):", reply_markup=bet_cancel_keyboard(), parse_mode="Markdown")
         return WAITING_DICE_BET
+    elif data == "play_coin":
+        await query.message.reply_text("🪙 **Орёл и Решка**\nШанс победы: 20% (x4.5).\nВведите ставку в RPLCoin (целое число):", reply_markup=bet_cancel_keyboard(), parse_mode="Markdown")
+        return WAITING_COIN_BET
 
 async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -4161,15 +4474,6 @@ async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Сообщение отправлено в поддержку.")
     return ConversationHandler.END
 
-# ---------- MAIN ----------
-# ---------- ЗАЩИТА ОТ "ЗАСТРЕВАНИЯ" В ВВОДЕ СТАВКИ ----------
-# Раньше, если игрок вводил некорректную ставку (или ставку больше баланса) в
-# Слотах / Костях / КНБ, бот оставался в состоянии "жду ставку" НАВСЕГДА.
-# Любое следующее сообщение (в том числе нажатие обычной кнопки меню) снова
-# воспринималось как попытка ввести ставку и бот писал "Введите ставку числом!"
-# по кругу, блокируя весь бот для игрока. Ниже — обработчик-предохранитель:
-# если во время ожидания ставки игрок нажимает ЛЮБУЮ кнопку главного меню,
-# мы аккуратно отменяем мини-игру и выполняем то действие, которое он выбрал.
 MAIN_MENU_TEXT_HANDLERS = {
     "🏠 Главное меню": main_menu,
     "🃏 Бесплатная карта": rplcards_command,
@@ -4188,8 +4492,8 @@ MAIN_MENU_TEXT_HANDLERS = {
 MAIN_MENU_REGEX = "^(" + "|".join(re.escape(k) for k in MAIN_MENU_TEXT_HANDLERS) + ")$"
 
 async def bet_state_menu_escape(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Срабатывает, если во время ввода ставки игрок нажал кнопку главного меню."""
     context.user_data.pop("rps_bet", None)
+    context.user_data.pop("coin_bet", None)
     text = update.message.text
     handler = MAIN_MENU_TEXT_HANDLERS.get(text)
     if handler:
@@ -4197,10 +4501,10 @@ async def bet_state_menu_escape(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 async def cancel_minigame_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает инлайн-кнопку "🔙 Назад" на экране ввода ставки."""
     query = update.callback_query
     await query.answer()
     context.user_data.pop("rps_bet", None)
+    context.user_data.pop("coin_bet", None)
     try:
         await query.message.delete()
     except Exception:
@@ -4208,7 +4512,8 @@ async def cancel_minigame_callback(update: Update, context: ContextTypes.DEFAULT
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎮 Камень-Ножницы-Бумага", callback_data="play_rps")],
         [InlineKeyboardButton("🎰 Слоты", callback_data="play_slots")],
-        [InlineKeyboardButton("🎲 Кости", callback_data="play_dice")]
+        [InlineKeyboardButton("🎲 Кости", callback_data="play_dice")],
+        [InlineKeyboardButton("🪙 Орёл и Решка", callback_data="play_coin")]
     ])
     await context.bot.send_message(chat_id=update.effective_chat.id, text="🕹 **Выберите мини-игру:**", reply_markup=kb, parse_mode="Markdown")
     return ConversationHandler.END
@@ -4218,6 +4523,11 @@ def bet_cancel_keyboard():
 
 def main():
     app = Application.builder().token(TOKEN).build()
+
+    if app.job_queue:
+        app.job_queue.run_repeating(cooldown_notification_job, interval=60, first=10, name="cooldown_notifications")
+    else:
+        logger.warning("JobQueue недоступен. Установите python-telegram-bot[job-queue].")
 
     app.add_handler(CommandHandler("getid", getid_command))
 
@@ -4351,6 +4661,24 @@ def main():
     )
     app.add_handler(conv_dice)
 
+    conv_coin = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(inline_callback, pattern="^play_coin$"),
+            CommandHandler("coinflip", coin_command),
+            CommandHandler("coin", coin_command),
+        ],
+        states={WAITING_COIN_BET: [
+            MessageHandler(filters.Regex(MAIN_MENU_REGEX), bet_state_menu_escape),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, coin_receive_bet),
+        ]},
+        fallbacks=[
+            CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.")),
+            CallbackQueryHandler(cancel_minigame_callback, pattern="^cancel_minigame$"),
+        ],
+        per_message=False,
+    )
+    app.add_handler(conv_coin)
+
     conv_admin_shop_pack = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^📦 Выставить пак в магазин$") & filters.ChatType.PRIVATE, admin_buttons)
@@ -4415,9 +4743,11 @@ def main():
     app.add_handler(CommandHandler("shop", shop_command))
     app.add_handler(CommandHandler("cardshop", cardshop_command))
     app.add_handler(CommandHandler("trade", trade_command))
+    app.add_handler(CommandHandler("tradecancel", tradecancel_command))
     app.add_handler(CommandHandler("daily", daily_command))
     app.add_handler(CommandHandler("wheel", wheel_command))
     app.add_handler(CommandHandler("rps", rps_command))
+    app.add_handler(CommandHandler("coinflip", coin_command))
 
     # Текстовое меню
     app.add_handler(MessageHandler(filters.Regex("^🏠 Главное меню$"), main_menu))
@@ -4442,6 +4772,7 @@ def main():
     app.add_handler(CallbackQueryHandler(shop_callback_handler, pattern="^(preview_pack_|confirm_pack_|cancel_pack_buy)"))
     app.add_handler(CallbackQueryHandler(freepack_callback_handler, pattern="^claim_freepack_btn$"))
     app.add_handler(CallbackQueryHandler(rps_callback_handler, pattern="^rps_"))
+    app.add_handler(CallbackQueryHandler(coin_callback_handler, pattern="^coin_"))
     app.add_handler(CallbackQueryHandler(cancel_minigame_callback, pattern="^cancel_minigame$"))
     app.add_handler(CallbackQueryHandler(admin_shop_pack_callback, pattern="^adm_pack_"))
     app.add_handler(CallbackQueryHandler(inline_callback))
