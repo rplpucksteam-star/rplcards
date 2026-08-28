@@ -130,7 +130,9 @@ def init_db():
             goals_conceded INTEGER DEFAULT 0,
             custom_team_name TEXT DEFAULT 'RPL Team',
             custom_team_country TEXT DEFAULT 'Russian Federation',
-            custom_team_emoji TEXT DEFAULT '🏒'
+            custom_team_emoji TEXT DEFAULT '🏒',
+            coach_cooldown_until TIMESTAMP,
+            illegal_cooldown_until TIMESTAMP
         )
     ''')
     
@@ -146,7 +148,9 @@ def init_db():
         ADD COLUMN IF NOT EXISTS goals_conceded INTEGER DEFAULT 0,
         ADD COLUMN IF NOT EXISTS custom_team_name TEXT DEFAULT 'RPL Team',
         ADD COLUMN IF NOT EXISTS custom_team_country TEXT DEFAULT 'Russian Federation',
-        ADD COLUMN IF NOT EXISTS custom_team_emoji TEXT DEFAULT '🏒'
+        ADD COLUMN IF NOT EXISTS custom_team_emoji TEXT DEFAULT '🏒',
+        ADD COLUMN IF NOT EXISTS coach_cooldown_until TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS illegal_cooldown_until TIMESTAMP
     ''')
     
     c.execute('''
@@ -497,7 +501,7 @@ def main_menu_keyboard():
         ["🛒 Магазин Паков", "🏆 Топ MMR"],
         ["🤝 Трейд", "🎁 Промокод"],
         ["🎮 Мини-игры", "🎡 Колесо удачи"],
-        ["🎁 Ежедневный бонус"]
+        ["💼 Работы", "🎁 Ежедневный бонус"]
     ], resize_keyboard=True)
 
 def admin_menu_keyboard():
@@ -851,6 +855,275 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎡 **Колесо удачи прокручено!**\n\n{prize_text}",
         parse_mode="Markdown"
     )
+
+# ==================== РАЗДЕЛ "РАБОТЫ" ====================
+
+async def jobs_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
+    user = update.effective_user
+    get_or_create_user(user.id, user.username, user.first_name)
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏒 Тренер бросков (КД 2ч)", callback_data="job_coach_main")],
+        [InlineKeyboardButton("🕵️‍♂️ Нелегал (КД 12ч / 48ч)", callback_data="job_illegal_main")],
+        [InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main_inline")]
+    ])
+
+    text = (
+        "💼 **РАЗДЕЛ «РАБОТЫ»**\n\n"
+        "Здесь вы можете заработать дополнительные RPLCoin!\n\n"
+        "1️⃣ **Тренер бросков:**\n"
+        "• Шанс успеха: 40%\n"
+        "• Награда: **15 000 RPLCoin**\n"
+        "• Кулдаун: **2 часа**\n\n"
+        "2️⃣ **Нелегал:**\n"
+        "• Различные рискованные дела (Банк, Кошелек, Магазин).\n"
+        "• Возможность заработать до **100 000 RPLCoin**!\n"
+        "• Риск попасть в тюрьму (КД **48 часов**)!"
+    )
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+
+async def job_coach_main_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    user = query.from_user
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT coach_cooldown_until FROM users WHERE user_id = %s", (user.id,))
+    row = c.fetchone()
+    conn.close()
+
+    now = datetime.now()
+    cd_until = row.get('coach_cooldown_until') if row else None
+
+    if cd_until:
+        if isinstance(cd_until, str):
+            cd_until = datetime.fromisoformat(cd_until)
+        if now < cd_until:
+            rem = cd_until - now
+            hours, rem_sec = divmod(int(rem.total_seconds()), 3600)
+            minutes = rem_sec // 60
+            await query.edit_message_text(
+                f"⏳ **Вы устали после проведения тренировки!**\nСледующая работа «Тренер бросков» будет доступна через **{hours} ч {minutes} мин**.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]]),
+                parse_mode="Markdown"
+            )
+            return
+
+    text = "🏒 **Тренировка бросков! Какие броски будем тренировать?**"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🥅 Броски в девятку", callback_data="job_coach_shoot1")],
+        [InlineKeyboardButton("🎯 Буллиты", callback_data="job_coach_shoot2")],
+        [InlineKeyboardButton("⚡️ Щелчки", callback_data="job_coach_shoot3")],
+        [InlineKeyboardButton("🎬 Игровые моменты", callback_data="job_coach_shoot4")],
+        [InlineKeyboardButton("🛡 Против 2-х защитников", callback_data="job_coach_shoot5")],
+        [InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]
+    ])
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+
+async def job_coach_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    user = query.from_user
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT coach_cooldown_until FROM users WHERE user_id = %s", (user.id,))
+    row = c.fetchone()
+
+    now = datetime.now()
+    cd_until = row.get('coach_cooldown_until') if row else None
+
+    if cd_until:
+        if isinstance(cd_until, str):
+            cd_until = datetime.fromisoformat(cd_until)
+        if now < cd_until:
+            conn.close()
+            rem = cd_until - now
+            hours, rem_sec = divmod(int(rem.total_seconds()), 3600)
+            minutes = rem_sec // 60
+            await query.edit_message_text(
+                f"⏳ **Вы уже провели тренировку!** Отдохните еще **{hours} ч {minutes} мин**.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="jobs_menu")]]),
+                parse_mode="Markdown"
+            )
+            return
+
+    new_cd = now + timedelta(hours=2)
+
+    if random.random() < 0.40:
+        c.execute("UPDATE users SET balance = balance + 15000, coach_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
+        conn.commit()
+        conn.close()
+        res_text = "🎉 **ОТЛИЧНАЯ ТРЕНИРОВКА!** Игроки успешно отработали элементы, и руководство выплатило вам премию в размере **15 000 RPLCoin**!"
+    else:
+        c.execute("UPDATE users SET coach_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
+        conn.commit()
+        conn.close()
+        res_text = "😔 **НЕУДАЧНАЯ ТРЕНИРОВКА!** Броски летели мимо ворот, тренировка сорвалась. В этот раз вы остались без выплаты."
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]])
+    await query.edit_message_text(f"🏒 **Результат работы «Тренер бросков»:**\n\n{res_text}\n\n⏳ Следующая тренировка через 2 часа.", reply_markup=kb, parse_mode="Markdown")
+
+async def job_illegal_main_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    user = query.from_user
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT illegal_cooldown_until FROM users WHERE user_id = %s", (user.id,))
+    row = c.fetchone()
+    conn.close()
+
+    now = datetime.now()
+    cd_until = row.get('illegal_cooldown_until') if row else None
+
+    if cd_until:
+        if isinstance(cd_until, str):
+            cd_until = datetime.fromisoformat(cd_until)
+        if now < cd_until:
+            rem = cd_until - now
+            hours, rem_sec = divmod(int(rem.total_seconds()), 3600)
+            minutes = rem_sec // 60
+
+            if rem.total_seconds() > 12 * 3600:
+                msg_status = f"🚔 **ВЫ В ТЮРЬМЕ!**\nВас поймала полиция! Срок заключения закончится через **{hours} ч {minutes} мин**."
+            else:
+                msg_status = f"🕵️‍♂️ **НЕЛЬЗЯ РИСКОВАТЬ!**\nЛегавые на хвосте. Залечь на дно еще на **{hours} ч {minutes} мин**."
+
+            await query.edit_message_text(
+                msg_status,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]]),
+                parse_mode="Markdown"
+            )
+            return
+
+    text = (
+        "🕵️‍♂️ **РАБОТА «НЕЛЕГАЛ»**\n\n"
+        "Выберите, какое дело хотите прокрутить:\n\n"
+        "1️⃣ **Ограбить банк:**\n"
+        "• 🟢 Успех (15%): **100 000 RPLCoin**\n"
+        "• ⚪️ Неудача (15%): ничего\n"
+        "• 🔴 Тюрьма (70%): КД **48 часов**\n\n"
+        "2️⃣ **Украсть кошелёк:**\n"
+        "• 🟢 Успех (40%): **до 10 000 RPLCoin**\n"
+        "• ⚪️ Неудача (40%): ничего\n"
+        "• 🔴 Тюрьма (20%): КД **48 часов**\n\n"
+        "3️⃣ **Украсть продукты в магазине:**\n"
+        "• 🟢 Успех (30%): **до 15 000 RPLCoin**\n"
+        "• ⚪️ Неудача (30%): ничего\n"
+        "• 🔴 Тюрьма (40%): КД **48 часов**"
+    )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏦 Ограбить банк", callback_data="job_ill_bank")],
+        [InlineKeyboardButton("👛 Украсть кошелёк", callback_data="job_ill_wallet")],
+        [InlineKeyboardButton("🛒 Украсть продукты в магазине", callback_data="job_ill_groceries")],
+        [InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]
+    ])
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+
+async def job_illegal_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    user = query.from_user
+    action = query.data
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT illegal_cooldown_until FROM users WHERE user_id = %s", (user.id,))
+    row = c.fetchone()
+
+    now = datetime.now()
+    cd_until = row.get('illegal_cooldown_until') if row else None
+
+    if cd_until:
+        if isinstance(cd_until, str):
+            cd_until = datetime.fromisoformat(cd_until)
+        if now < cd_until:
+            conn.close()
+            rem = cd_until - now
+            hours, rem_sec = divmod(int(rem.total_seconds()), 3600)
+            minutes = rem_sec // 60
+            await query.edit_message_text(
+                f"⏳ Вы еще не можете делать нелегальные дела! Времени осталось: **{hours} ч {minutes} мин**.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="jobs_menu")]]),
+                parse_mode="Markdown"
+            )
+            return
+
+    rand_val = random.random()
+    res_text = ""
+
+    if action == "job_ill_bank":
+        if rand_val < 0.15:
+            reward = 100000
+            new_cd = now + timedelta(hours=12)
+            c.execute("UPDATE users SET balance = balance + %s, illegal_cooldown_until = %s WHERE user_id = %s", (reward, new_cd, user.id))
+            res_text = f"🎉 **ГРАНДИОЗНЫЙ УСПЕХ!** Вы ограбили банк и ушли незамеченными! Награда: **{reward} RPLCoin**! 💰\n⏳ Кулдаун: 12 часов."
+        elif rand_val < 0.30:
+            new_cd = now + timedelta(hours=12)
+            c.execute("UPDATE users SET illegal_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
+            res_text = "⚪️ **НЕУДАЧА!** Сигнализация сработала, но вам удалось сбежать без добычи!\n⏳ Кулдаун: 12 часов."
+        else:
+            new_cd = now + timedelta(hours=48)
+            c.execute("UPDATE users SET illegal_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
+            res_text = "🚨 **ТЮРЬМА!** Охрана банка скрутила вас прямо у хранилища! Вы отправлены за решетку.\n🚔 Срок заключения: **48 часов**."
+
+    elif action == "job_ill_wallet":
+        if rand_val < 0.40:
+            reward = random.randint(1000, 10000)
+            new_cd = now + timedelta(hours=12)
+            c.execute("UPDATE users SET balance = balance + %s, illegal_cooldown_until = %s WHERE user_id = %s", (reward, new_cd, user.id))
+            res_text = f"🎉 **УСПЕХ!** Вы тихо вытащили кошелёк из кармана и нашли там **{reward} RPLCoin**! 👛\n⏳ Кулдаун: 12 часов."
+        elif rand_val < 0.80:
+            new_cd = now + timedelta(hours=12)
+            c.execute("UPDATE users SET illegal_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
+            res_text = "⚪️ **НЕУДАЧА!** В кошельке не оказалось наличных, пришлось выкинуть его.\n⏳ Кулдаун: 12 часов."
+        else:
+            new_cd = now + timedelta(hours=48)
+            c.execute("UPDATE users SET illegal_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
+            res_text = "🚨 **ТЮРЬМА!** Владелец кошелька заметил кражу и вызвал полицию! Вы арестованы.\n🚔 Срок заключения: **48 часов**."
+
+    elif action == "job_ill_groceries":
+        if rand_val < 0.30:
+            reward = random.randint(1000, 15000)
+            new_cd = now + timedelta(hours=12)
+            c.execute("UPDATE users SET balance = balance + %s, illegal_cooldown_until = %s WHERE user_id = %s", (reward, new_cd, user.id))
+            res_text = f"🎉 **УСПЕХ!** Вы вынесли товары из супермаркета и перепродали их на сумму **{reward} RPLCoin**! 🛒\n⏳ Кулдаун: 12 часов."
+        elif rand_val < 0.60:
+            new_cd = now + timedelta(hours=12)
+            c.execute("UPDATE users SET illegal_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
+            res_text = "⚪️ **НЕУДАЧА!** Охранник заметил вас на выходе, пришлось бросить сумки и удрать.\n⏳ Кулдаун: 12 часов."
+        else:
+            new_cd = now + timedelta(hours=48)
+            c.execute("UPDATE users SET illegal_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
+            res_text = "🚨 **ТЮРЬМА!** Вас зажали в тупике охранники магазина и передали полиции.\n🚔 Срок заключения: **48 часов**."
+
+    conn.commit()
+    conn.close()
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]])
+    await query.edit_message_text(f"🕵️‍♂️ **Результат работы «Нелегал»:**\n\n{res_text}", reply_markup=kb, parse_mode="Markdown")
+
+# =========================================================
 
 async def rps_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -3980,6 +4253,7 @@ MAIN_MENU_TEXT_HANDLERS = {
     "🤝 Трейд": trade_command,
     "🎁 Промокод": promo_command,
     "🎡 Колесо удачи": wheel_command,
+    "💼 Работы": jobs_menu_command,
     "🎁 Ежедневный бонус": daily_command,
     "🎮 Мини-игры": minigames_menu,
 }
@@ -4067,6 +4341,8 @@ def main():
 
     app.add_handler(CommandHandler("getid", getid_command))
     app.add_handler(CommandHandler("tradecancel", tradecancel_command))
+    app.add_handler(CommandHandler("jobs", jobs_menu_command))
+    app.add_handler(CommandHandler("works", jobs_menu_command))
 
     conv_auth = ConversationHandler(
         entry_points=[CommandHandler("adminkarpl", adminkarpl)],
@@ -4305,8 +4581,15 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🏆 Топ MMR$"), cardmmr_command))
     app.add_handler(MessageHandler(filters.Regex("^🤝 Трейд$"), trade_command))
     app.add_handler(MessageHandler(filters.Regex("^🎡 Колесо удачи$"), wheel_command))
+    app.add_handler(MessageHandler(filters.Regex("^💼 Работы$"), jobs_menu_command))
     app.add_handler(MessageHandler(filters.Regex("^🎁 Ежедневный бонус$"), daily_command))
     app.add_handler(MessageHandler(filters.Regex("^🎮 Мини-игры$"), minigames_menu))
+
+    app.add_handler(CallbackQueryHandler(jobs_menu_command, pattern="^jobs_menu$"))
+    app.add_handler(CallbackQueryHandler(job_coach_main_handler, pattern="^job_coach_main$"))
+    app.add_handler(CallbackQueryHandler(job_coach_action_handler, pattern="^job_coach_shoot"))
+    app.add_handler(CallbackQueryHandler(job_illegal_main_handler, pattern="^job_illegal_main$"))
+    app.add_handler(CallbackQueryHandler(job_illegal_action_handler, pattern="^job_ill_"))
 
     app.add_handler(CallbackQueryHandler(inventory_callback_handler, pattern="^(refresh_inv|craft_leg_|sell_menu|do_sell_)"))
     app.add_handler(CallbackQueryHandler(market_callback_handler, pattern="^(refresh_market|my_market_items|market_list_menu|cancel_market_|buy_market_)"))
