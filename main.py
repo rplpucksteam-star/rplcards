@@ -58,10 +58,11 @@ XP_FOR_CARD_RARITY = {
     "Легендарная": 500,
 }
 
+# Обновлённые цены бустеров
 BOOSTERS = {
     "rare": {
         "title": "🔷 Редкий бустер",
-        "price": 15000,
+        "price": 50000,
         "xp": 50,
         "xp_percent": 25,
         "money_percent": 0,
@@ -69,7 +70,7 @@ BOOSTERS = {
     },
     "epic": {
         "title": "🟣 Эпический бустер",
-        "price": 35000,
+        "price": 100000,
         "xp": 175,
         "xp_percent": 30,
         "money_percent": 0,
@@ -77,7 +78,7 @@ BOOSTERS = {
     },
     "mythic": {
         "title": "🔴 Мифический бустер",
-        "price": 70000,
+        "price": 250000,
         "xp": 250,
         "xp_percent": 30,
         "money_percent": 0,
@@ -85,7 +86,7 @@ BOOSTERS = {
     },
     "legendary": {
         "title": "🟡 Легендарный бустер",
-        "price": 130000,
+        "price": 500000,
         "xp": 500,
         "xp_percent": 30,
         "money_percent": 30,
@@ -144,7 +145,12 @@ BOOSTERS = {
     WAITING_TEAM_NAME,
     WAITING_TEAM_COUNTRY,
     WAITING_TEAM_EMOJI,
-) = range(50)
+    # Новые состояния для патчей
+    WAITING_PATCH_TITLE,
+    WAITING_PATCH_DATE,
+    WAITING_PATCH_DESC,
+    WAITING_PATCH_PHOTO,
+) = range(54)
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -361,6 +367,18 @@ def init_db():
         )
     ''')
     
+    # ===== ТАБЛИЦА ПАТЧЕЙ =====
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS patches (
+            id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            patch_date TEXT NOT NULL,
+            description TEXT NOT NULL,
+            photo_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -495,6 +513,63 @@ def add_job_money(cursor, user_id, amount):
     final_amount = int(amount * (100 + percent) / 100)
     cursor.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (final_amount, user_id))
     return final_amount
+
+# ==================== ФУНКЦИИ ДЛЯ ПАТЧЕЙ ====================
+def add_patch(title, patch_date, description, photo_id=None):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO patches (title, patch_date, description, photo_id)
+        VALUES (%s, %s, %s, %s) RETURNING id
+    """, (title, patch_date, description, photo_id))
+    patch_id = c.fetchone()['id']
+    conn.commit()
+    conn.close()
+    return patch_id
+
+def get_patches(limit=5):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, title, patch_date, description, photo_id, created_at FROM patches ORDER BY created_at DESC LIMIT %s", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_patch(patch_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, title, patch_date, description, photo_id, created_at FROM patches WHERE id = %s", (patch_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def get_all_users():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users")
+    rows = c.fetchall()
+    conn.close()
+    return [row['user_id'] for row in rows]
+
+# ==================== ФУНКЦИЯ РАССЫЛКИ ====================
+async def broadcast_patch(context, patch_id):
+    patch = get_patch(patch_id)
+    if not patch:
+        return
+    users = get_all_users()
+    text = f"📢 **НОВЫЙ ПАТЧ!**\n\n" \
+           f"**{patch['title']}**\n" \
+           f"📅 Дата: {patch['patch_date']}\n\n" \
+           f"{patch['description']}"
+    for user_id in users:
+        try:
+            if patch['photo_id']:
+                await context.bot.send_photo(chat_id=user_id, photo=patch['photo_id'], caption=text, parse_mode="Markdown")
+            else:
+                await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
+            await asyncio.sleep(0.1)  # небольшая задержка, чтобы не превысить лимиты
+        except Exception:
+            pass
 
 async def check_pm_registered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
@@ -676,6 +751,7 @@ def main_menu_keyboard():
         ["🤝 Обмен", "🎟 Промокод"],
         ["🎮 Игры", "🎡 Колесо удачи"],
         ["💼 Работы", "🎁 Ежедневная награда"],
+        ["📜 Патчи"]  # Новая кнопка
     ], resize_keyboard=True)
 
 def admin_menu_keyboard():
@@ -684,7 +760,8 @@ def admin_menu_keyboard():
         ["📩 Проверить поддержку", "⚙️ Настройки"],
         ["🎮 Настройки игры", "🃏 Карточки"],
         ["📦 Выставить пак в магазин", "🔍 Инвентарь игрока"],
-        ["👥 Список игроков", "🚪 Выйти"]
+        ["👥 Список игроков", "➕ Добавить патч"],  # Новая кнопка
+        ["🚪 Выйти"]
     ], resize_keyboard=True)
 
 def card_admin_keyboard():
@@ -699,8 +776,10 @@ def card_admin_keyboard():
 
 def welcome_inline_keyboard():
     keyboard = [
-        [InlineKeyboardButton("💬 Наш Discord", callback_data="discord")],
-        [InlineKeyboardButton("🌐 Наш Сайт", callback_data="website")],
+        [InlineKeyboardButton("💬 Наш Discord", url="https://discord.gg/dgkFMCgDwx")],
+        [InlineKeyboardButton("🌐 Наш Сайт", url="https://rplpuck.ru")],
+        [InlineKeyboardButton("📢 Сообщество", url="https://t.me/rplpuck")],
+        [InlineKeyboardButton("📜 Патчи", callback_data="patches_list")],
         [InlineKeyboardButton("🆘 Обратиться в поддержку", callback_data="support")],
         [InlineKeyboardButton("🏒 Дуэль Буллитов", callback_data="duel")]
     ]
@@ -1146,7 +1225,6 @@ async def job_coach_action_handler(update: Update, context: ContextTypes.DEFAULT
 
     if random.random() < 0.40:
         reward = 15000
-        # Используем add_job_money для учёта бонуса
         final_reward = add_job_money(c, user.id, reward)
         c.execute("UPDATE users SET coach_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
         conn.commit()
@@ -4386,11 +4464,58 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "👥 Список игроков":
         await admin_show_players_list(update, context)
         return ConversationHandler.END
+    elif text == "➕ Добавить патч":
+        await update.message.reply_text("📝 Введите название патча:")
+        return WAITING_PATCH_TITLE
     elif text == "🚪 Выйти":
         remove_admin(user_id)
         await update.message.reply_text("🚪 Выход.", reply_markup=main_menu_keyboard())
         return
     return ConversationHandler.END
+
+# ==================== АДМИН-ДОБАВЛЕНИЕ ПАТЧА ====================
+async def admin_patch_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["patch_title"] = update.message.text.strip()
+    await update.message.reply_text("📅 Введите дату патча (например, 30.08.2026):")
+    return WAITING_PATCH_DATE
+
+async def admin_patch_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["patch_date"] = update.message.text.strip()
+    await update.message.reply_text("📝 Введите описание патча (текст):")
+    return WAITING_PATCH_DESC
+
+async def admin_patch_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["patch_desc"] = update.message.text.strip()
+    await update.message.reply_text("🖼 Отправьте фото (или нажмите /skip для пропуска):")
+    return WAITING_PATCH_PHOTO
+
+async def admin_patch_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo_id = update.message.photo[-1].file_id if update.message.photo else None
+    context.user_data["patch_photo"] = photo_id
+    await save_patch_and_broadcast(update, context)
+    return ConversationHandler.END
+
+async def admin_patch_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["patch_photo"] = None
+    await save_patch_and_broadcast(update, context)
+    return ConversationHandler.END
+
+async def save_patch_and_broadcast(update, context):
+    title = context.user_data.get("patch_title")
+    patch_date = context.user_data.get("patch_date")
+    desc = context.user_data.get("patch_desc")
+    photo = context.user_data.get("patch_photo")
+
+    if not all([title, patch_date, desc]):
+        await update.message.reply_text("❌ Не все данные заполнены. Попробуйте снова /adminkarpl.")
+        return
+
+    patch_id = add_patch(title, patch_date, desc, photo)
+    await update.message.reply_text(f"✅ Патч «{title}» сохранён! (ID {patch_id})", reply_markup=admin_menu_keyboard())
+
+    # Рассылка
+    await broadcast_patch(context, patch_id)
+    await update.message.reply_text("📢 Рассылка патча завершена!")
 
 async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.text.strip()
@@ -4425,6 +4550,52 @@ async def show_support_messages(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📋 Настройки", reply_markup=admin_menu_keyboard())
+
+# ==================== ПРОСМОТР ПАТЧЕЙ ДЛЯ ИГРОКОВ ====================
+async def patches_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+    patches = get_patches(limit=5)
+    if not patches:
+        text = "📜 **История патчей**\n\nПока нет выпущенных патчей."
+        if query:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main_inline")]]))
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main_inline")]]))
+        return
+
+    text = "📜 **Последние патчи:**\n\n"
+    buttons = []
+    for p in patches:
+        text += f"**{p['title']}** ({p['patch_date']})\n"
+        buttons.append([InlineKeyboardButton(f"📖 {p['title']}", callback_data=f"patch_view_{p['id']}")])
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main_inline")])
+
+    if query:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
+async def patch_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    patch_id = int(query.data.split("_")[2])
+    patch = get_patch(patch_id)
+    if not patch:
+        await query.edit_message_text("❌ Патч не найден.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="patches_list")]]))
+        return
+
+    text = f"📢 **{patch['title']}**\n📅 {patch['patch_date']}\n\n{patch['description']}"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к списку", callback_data="patches_list")]])
+    if patch['photo_id']:
+        try:
+            await query.message.delete()
+            await context.bot.send_photo(chat_id=query.from_user.id, photo=patch['photo_id'], caption=text, reply_markup=kb, parse_mode="Markdown")
+        except Exception:
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
 
 # ==================== МАГАЗИН БУСТЕРОВ (ПАТЧ) ====================
 async def store_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4581,6 +4752,10 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "play_dice":
         await query.message.reply_text("🎲 Введите ставку для Костей:", reply_markup=bet_cancel_keyboard(), parse_mode="Markdown")
         return WAITING_DICE_BET
+    elif data == "patches_list":
+        await patches_list(update, context)
+    elif data.startswith("patch_view_"):
+        await patch_view(update, context)
 
 async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -4613,6 +4788,7 @@ MAIN_MENU_TEXT_HANDLERS = {
     "💼 Работы": jobs_menu_command,
     "🎁 Ежедневная награда": daily_command,
     "🎮 Игры": minigames_menu,
+    "📜 Патчи": patches_list,
 }
 MAIN_MENU_REGEX = "^(" + "|".join(re.escape(k) for k in MAIN_MENU_TEXT_HANDLERS) + ")$"
 
@@ -4873,6 +5049,23 @@ def main():
     )
     app.add_handler(conv_admin_shop_pack)
 
+    # ConversationHandler для добавления патча
+    conv_patch = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^➕ Добавить патч$") & filters.ChatType.PRIVATE, admin_buttons)],
+        states={
+            WAITING_PATCH_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_patch_title)],
+            WAITING_PATCH_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_patch_date)],
+            WAITING_PATCH_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_patch_desc)],
+            WAITING_PATCH_PHOTO: [
+                MessageHandler(filters.PHOTO, admin_patch_photo),
+                CommandHandler("skip", admin_patch_skip),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
+    )
+    app.add_handler(conv_patch)
+
     conv_cards = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🃏 Карточки$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={
@@ -4942,6 +5135,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^💼 Работы$"), jobs_menu_command))
     app.add_handler(MessageHandler(filters.Regex("^🎁 Ежедневная награда$"), daily_command))
     app.add_handler(MessageHandler(filters.Regex("^🎮 Игры$"), minigames_menu))
+    app.add_handler(MessageHandler(filters.Regex("^📜 Патчи$"), patches_list))
 
     app.add_handler(CallbackQueryHandler(jobs_menu_command, pattern="^jobs_menu$"))
     app.add_handler(CallbackQueryHandler(job_coach_main_handler, pattern="^job_coach_main$"))
