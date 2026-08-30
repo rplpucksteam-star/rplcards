@@ -186,7 +186,7 @@ BATTLE_PASS_TASKS = [
     WAITING_BP_DESC,
     WAITING_BP_END_DATE,
     WAITING_BP_PHOTO,
-) = range(60)
+) = range(62)
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
