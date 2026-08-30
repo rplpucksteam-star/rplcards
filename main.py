@@ -1167,6 +1167,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
+async def getid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await update.message.reply_text(
+        f"🆔 **ID этого чата:** `{chat.id}`\n📌 **Тип чата:** `{chat.type}`",
+        parse_mode="Markdown"
+    )
+
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
