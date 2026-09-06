@@ -4428,16 +4428,16 @@ def _active_bp():
 
 def _bp_rewards():
     import random
-    # Базовый пул уникальных наград (без дубликатов)
+    # Базовый пул уникальных наград (тип, описание, значение)
     pool = [
-        ("money", "💰 3 000 RPLCoin", 3000),
+        ("money", "💰 1 000 RPLCoin", 1000),
+        ("money", "💰 2 500 RPLCoin", 2500),
+        ("money", "💰 5 000 RPLCoin", 5000),
         ("money", "💰 10 000 RPLCoin", 10000),
         ("money", "💰 25 000 RPLCoin", 25000),
         ("money", "💰 50 000 RPLCoin", 50000),
         ("money", "💰 100 000 RPLCoin", 100000),
-        ("money", "💰 150 000 RPLCoin", 150000),
         ("money", "💰 250 000 RPLCoin", 250000),
-        ("money", "💰 500 000 RPLCoin", 500000),
         ("money_range", "💰 1 000 – 5 000", (1000, 5000)),
         ("money_range", "💰 5 000 – 15 000", (5000, 15000)),
         ("money_range", "💰 15 000 – 30 000", (15000, 30000)),
@@ -4450,14 +4450,14 @@ def _bp_rewards():
         ("card_ovr", "🃏 Карточка 70–80 OVR", (70, 80)),
         ("card_ovr", "🃏 Карточка 80–85 OVR", (80, 85)),
         ("card_ovr", "🃏 Карточка 85–90 OVR", (85, 90)),
-        ("rarity", "🃏 Любая редкая карта", "Редкая"),
-        ("rarity", "🃏 Любая очень редкая карта", "Очень редкая"),
-        ("rarity", "🃏 Любая эпическая карта", "Эпическая"),
-        ("rarity", "🃏 Любая мифическая карта", "Мифическая"),
-        ("rarity", "🃏 Любая легендарная карта", "Легендарная"),
-        ("cards3_low", "📦 Набор 3 карт 50–60 OVR", None),
-        ("cards3_any", "📦 Набор 3 любых карт", None),
-        ("cards3_upto", "📦 Набор 3 карт до 89 OVR", 89),
+        ("rarity", "🃏 Редкая карта", "Редкая"),
+        ("rarity", "🃏 Очень редкая карта", "Очень редкая"),
+        ("rarity", "🃏 Эпическая карта", "Эпическая"),
+        ("rarity", "🃏 Мифическая карта", "Мифическая"),
+        ("rarity", "🃏 Легендарная карта", "Легендарная"),
+        ("cards3_low", "📦 3 карты 50–60 OVR", None),
+        ("cards3_any", "📦 3 любые карты", None),
+        ("cards3_upto", "📦 3 карты до 89 OVR", 89),
         ("booster", "🔷 Редкий бустер", "rare"),
         ("booster", "🟣 Эпический бустер", "epic"),
         ("booster", "🔴 Мифический бустер", "mythic"),
@@ -4466,27 +4466,33 @@ def _bp_rewards():
         ("discount", "🏷 Скидка 10%", 10),
         ("discount", "🏷 Скидка 15%", 15),
         ("discount", "🏷 Скидка 20%", 20),
-        ("wheel_reset", "🎡 Обнуление колеса удачи", None),
-        ("free_reset", "🎴 Обнуление КД бесплатной карты", None),
-        ("bank_reset", "🏦 Обнуление ограбления банка", None),
+        ("wheel_reset", "🎡 Обнуление колеса", None),
+        ("free_reset", "🎴 Обнуление КД карты", None),
+        ("bank_reset", "🏦 Обнуление ограбления", None),
         ("training_reset", "🏒 Обнуление тренировки", None),
         ("goalie", "🧤 Вратарь до 91 OVR", 91),
-        ("nothing_legendary", "🌟 Легендарная награда (загадка)", None),
+        ("nothing_legendary", "🌟 Загадочная награда", None),
     ]
-    # Перемешиваем, чтобы распределение было случайным, но детерминированным
-    random.seed(42)  # для воспроизводимости, можно убрать
-    random.shuffle(pool)
+    total_levels = 250
+    expanded = []
+    # Повторяем пул несколько раз, каждый раз перемешивая
+    for _ in range(total_levels // len(pool) + 2):
+        shuffled = pool.copy()
+        random.shuffle(shuffled)
+        expanded.extend(shuffled)
+    expanded = expanded[:total_levels]
+    # Убираем повторяющиеся соседние награды (меняем местами)
+    for i in range(1, len(expanded)):
+        if expanded[i][0] == expanded[i-1][0] and expanded[i][1] == expanded[i-1][1]:
+            for j in range(i+1, min(i+10, len(expanded))):
+                if expanded[j][0] != expanded[i-1][0] or expanded[j][1] != expanded[i-1][1]:
+                    expanded[i], expanded[j] = expanded[j], expanded[i]
+                    break
     rewards = {}
-    # Заполняем уровни от 2 до 249 с шагом, чтобы охватить все уровни
-    step = max(1, (250 - 2) // len(pool))  # примерно 4-5 уровней между наградами
-    positions = list(range(2, 250, step))[:len(pool)]
-    # Добавляем недостающие уровни, если не хватило
-    if len(positions) < len(pool):
-        positions += [250 - i for i in range(1, len(pool) - len(positions) + 1)]
-    for level, item in zip(positions, pool):
-        rewards[level] = item
-    # Легендарные бустеры на уровнях 50, 70, 90, 110, 130, 150, 170, 190, 210, 230
-    for i, level in enumerate(range(50, 240, 20), start=1):
+    for level in range(1, total_levels+1):
+        rewards[level] = expanded[level-1]
+    # Легендарные бустеры на уровнях 50,70,90,110,130,150,170,190,210,230
+    for level in [50, 70, 90, 110, 130, 150, 170, 190, 210, 230]:
         rewards[level] = ("booster", "🟡 Легендарный бустер", "legendary")
     # Эксклюзивная карточка на 250 уровне
     rewards[250] = ("card_ovr", "👑 Эксклюзивная карточка 97–99 OVR", (97, 99))
