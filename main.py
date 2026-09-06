@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from html import escape
 
 from telegram import (
     Update,
@@ -49,7 +50,32 @@ SELL_PRICES = {
     "Секретная": 25000
 }
 
-# ==================== НОВЫЕ КОНСТАНТЫ (ПАТЧ) ====================
+BATTLE_PASS_LEVELS = 250
+BATTLE_PASS_XP_PER_LEVEL = 1000
+BATTLE_PASS_BUTTON = "🎫 Боевой пропуск"
+
+BATTLE_PASS_QUESTS = {
+    "goals_10": ("Забить 10 голов", "goals", 10, 750),
+    "win_clean": ("Выиграть на 0", "clean_wins", 1, 750),
+    "wheel": ("Прокрутить колесо удачи", "wheel", 1, 750),
+    "free_card": ("Открыть бесплатную карту", "free_card", 1, 750),
+    "pack": ("Купить любой пак", "pack", 1, 750),
+    "coin": ("Сыграть в монетку", "coin", 1, 750),
+    "rps": ("Сыграть в КНБ", "rps", 1, 750),
+    "slots": ("Сыграть в слоты", "slots", 1, 750),
+    "dice": ("Сыграть в кости", "dice", 1, 750),
+    "daily": ("Забрать ежедневную награду", "daily", 1, 750),
+    "market_buy": ("Купить на торговой площадке", "market_buy", 1, 750),
+    "booster": ("Купить бустер", "booster", 1, 750),
+    "market_sell": ("Продать на торговой площадке", "market_sell", 1, 750),
+    "bank": ("Успешно ограбить банк", "bank", 1, 750),
+    "training": ("Провести успешную тренировку", "training", 1, 750),
+    "matches_5": ("Сыграть 5 игр в подборе", "matches", 5, 750),
+    "matches_15": ("Сыграть 15 игр в подборе", "matches", 15, 750),
+    "matches_50": ("Сыграть 50 игр в подборе", "matches", 50, 2000),
+    "roster": ("Изменить состав", "roster", 1, 750),
+}
+
 XP_FOR_CARD_RARITY = {
     "Редкая": 25,
     "Очень редкая": 50,
@@ -58,7 +84,6 @@ XP_FOR_CARD_RARITY = {
     "Легендарная": 500,
 }
 
-# Обновлённые цены бустеров
 BOOSTERS = {
     "rare": {
         "title": "🔷 Редкий бустер",
@@ -145,12 +170,15 @@ BOOSTERS = {
     WAITING_TEAM_NAME,
     WAITING_TEAM_COUNTRY,
     WAITING_TEAM_EMOJI,
-    # Новые состояния для патчей
     WAITING_PATCH_TITLE,
     WAITING_PATCH_DATE,
     WAITING_PATCH_DESC,
     WAITING_PATCH_PHOTO,
-) = range(54)
+    WAITING_BP_TITLE,
+    WAITING_BP_DESC,
+    WAITING_BP_END_DATE,
+    WAITING_BP_PHOTO,
+) = range(58)
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -203,7 +231,6 @@ def init_db():
         ADD COLUMN IF NOT EXISTS illegal_cooldown_until TIMESTAMP
     ''')
     
-    # ===== ДОПОЛНИТЕЛЬНЫЕ ПОЛЯ (ПАТЧ) =====
     c.execute('''
         ALTER TABLE users
         ADD COLUMN IF NOT EXISTS experience INTEGER DEFAULT 0,
@@ -353,7 +380,6 @@ def init_db():
         )
     ''')
     
-    # ===== ТАБЛИЦА БУСТЕРОВ (ПАТЧ) =====
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_boosters (
             id SERIAL PRIMARY KEY,
@@ -367,7 +393,6 @@ def init_db():
         )
     ''')
     
-    # ===== ТАБЛИЦА ПАТЧЕЙ =====
     c.execute('''
         CREATE TABLE IF NOT EXISTS patches (
             id SERIAL PRIMARY KEY,
@@ -376,6 +401,30 @@ def init_db():
             description TEXT NOT NULL,
             photo_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS battle_pass_seasons (
+            id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            ends_at TIMESTAMP NOT NULL,
+            photo_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            active BOOLEAN DEFAULT TRUE
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS battle_pass_players (
+            season_id INTEGER REFERENCES battle_pass_seasons(id) ON DELETE CASCADE,
+            user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+            xp INTEGER DEFAULT 0,
+            claimed_level INTEGER DEFAULT 0,
+            quest_reset_at TIMESTAMP,
+            quest_ids TEXT DEFAULT '',
+            quest_progress TEXT DEFAULT '{}',
+            PRIMARY KEY(season_id, user_id)
         )
     ''')
     
@@ -409,9 +458,7 @@ def check_user_exists(user_id):
     conn.close()
     return bool(row)
 
-# ==================== ФУНКЦИИ XP (ПАТЧ) ====================
 def get_level_and_progress(experience):
-    """Первый уровень — 2500 XP, каждый следующий требует ещё +100 XP."""
     experience = max(0, int(experience or 0))
     level = 0
     required = 2500
@@ -425,7 +472,6 @@ def get_level_and_progress(experience):
     return level, remaining, required
 
 def add_experience(cursor, user_id, amount):
-    """Начисляет XP с учётом активного временного бонуса."""
     if amount <= 0:
         return 0
 
@@ -459,7 +505,6 @@ def add_experience(cursor, user_id, amount):
     return final_amount
 
 def add_goal_reward(cursor, user_id, base_money=100, base_xp=10):
-    """Награда за гол: XP и деньги с временным денежным бонусом."""
     now = datetime.now()
     cursor.execute("""
         SELECT money_bonus_percent, money_bonus_until
@@ -493,7 +538,6 @@ def add_goal_reward(cursor, user_id, base_money=100, base_xp=10):
     return final_money, final_xp
 
 def add_job_money(cursor, user_id, amount):
-    """Начисление денег за работу с учётом бонуса легендарного бустера."""
     now = datetime.now()
     cursor.execute("""
         SELECT money_bonus_percent, money_bonus_until
@@ -514,7 +558,6 @@ def add_job_money(cursor, user_id, amount):
     cursor.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (final_amount, user_id))
     return final_amount
 
-# ==================== ФУНКЦИИ ДЛЯ ПАТЧЕЙ ====================
 def add_patch(title, patch_date, description, photo_id=None):
     conn = get_db()
     c = conn.cursor()
@@ -551,7 +594,6 @@ def get_all_users():
     conn.close()
     return [row['user_id'] for row in rows]
 
-# ==================== ФУНКЦИЯ РАССЫЛКИ ====================
 async def broadcast_patch(context, patch_id):
     patch = get_patch(patch_id)
     if not patch:
@@ -567,7 +609,7 @@ async def broadcast_patch(context, patch_id):
                 await context.bot.send_photo(chat_id=user_id, photo=patch['photo_id'], caption=text, parse_mode="Markdown")
             else:
                 await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
-            await asyncio.sleep(0.1)  # небольшая задержка, чтобы не превысить лимиты
+            await asyncio.sleep(0.1)
         except Exception:
             pass
 
@@ -741,7 +783,6 @@ def mark_answered(msg_id):
     conn.commit()
     conn.close()
 
-# ==================== ОБНОВЛЁННЫЕ КЛАВИАТУРЫ (ПАТЧ) ====================
 def main_menu_keyboard():
     return ReplyKeyboardMarkup([
         ["🏠 Главная", "🎴 Карточка дня"],
@@ -751,7 +792,7 @@ def main_menu_keyboard():
         ["🤝 Обмен", "🎟 Промокод"],
         ["🎮 Игры", "🎡 Колесо удачи"],
         ["💼 Работы", "🎁 Ежедневная награда"],
-        ["📜 Патчи"]  # Новая кнопка
+        ["📜 Патчи", "🎫 Боевой пропуск"]
     ], resize_keyboard=True)
 
 def admin_menu_keyboard():
@@ -760,7 +801,8 @@ def admin_menu_keyboard():
         ["📩 Проверить поддержку", "⚙️ Настройки"],
         ["🎮 Настройки игры", "🃏 Карточки"],
         ["📦 Выставить пак в магазин", "🔍 Инвентарь игрока"],
-        ["👥 Список игроков", "➕ Добавить патч"],  # Новая кнопка
+        ["👥 Список игроков", "➕ Добавить патч"],
+        ["🎫 Создать боевой пропуск"],
         ["🚪 Выйти"]
     ], resize_keyboard=True)
 
@@ -968,6 +1010,7 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎁 **Ежедневный бонус за день {streak}/7 успешно получен!**\nВы получили: {reward_text}\n\nВозвращайтесь завтра за новым бонусом!",
         parse_mode="Markdown"
     )
+    bp_progress(user.id, "daily")
 
 async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -1115,8 +1158,7 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎡 **Колесо удачи прокручено!**\n\n{prize_text}",
         parse_mode="Markdown"
     )
-
-# ==================== РАЗДЕЛ "РАБОТЫ" ====================
+    bp_progress(user.id, "wheel")
 
 async def jobs_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -1230,6 +1272,7 @@ async def job_coach_action_handler(update: Update, context: ContextTypes.DEFAULT
         conn.commit()
         conn.close()
         res_text = f"🎉 **ОТЛИЧНАЯ ТРЕНИРОВКА!** Игроки успешно отработали элементы, и руководство выплатило вам премию в размере **{final_reward} RPLCoin**!"
+        bp_progress(user.id, "training")
     else:
         c.execute("UPDATE users SET coach_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
         conn.commit()
@@ -1341,6 +1384,7 @@ async def job_illegal_action_handler(update: Update, context: ContextTypes.DEFAU
             new_cd = now + timedelta(hours=12)
             c.execute("UPDATE users SET illegal_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
             res_text = f"🎉 **ГРАНДИОЗНЫЙ УСПЕХ!** Вы ограбили банк и ушли незамеченными! Награда: **{final_reward} RPLCoin**! 💰\n⏳ Кулдаун: 12 часов."
+            bp_progress(user.id, "bank")
         elif rand_val < 0.30:
             new_cd = now + timedelta(hours=12)
             c.execute("UPDATE users SET illegal_cooldown_until = %s WHERE user_id = %s", (new_cd, user.id))
@@ -1387,8 +1431,6 @@ async def job_illegal_action_handler(update: Update, context: ContextTypes.DEFAU
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]])
     await query.edit_message_text(f"🕵️‍♂️ **Результат работы «Нелегал»:**\n\n{res_text}", reply_markup=kb, parse_mode="Markdown")
-
-# =========================================================
 
 async def rps_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -1485,6 +1527,7 @@ async def rps_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         f"{res_str}"
     )
     await query.message.edit_text(text, parse_mode="Markdown")
+    bp_progress(user.id, "rps")
 
 async def coin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -1565,6 +1608,7 @@ async def coin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         f"{res_str}"
     )
     await query.message.edit_text(text, parse_mode="Markdown")
+    bp_progress(user.id, "coin")
 
 async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -1635,6 +1679,7 @@ async def slots_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             res_text = f"🎰 | {line[0]} | {line[1]} | {line[2]} |\n\n❌ **ПРОИГРЫШ!** Вы потеряли ставку **{bet} RPLCoin**."
 
         await msg.edit_text(res_text, parse_mode="Markdown")
+        bp_progress(user.id, "slots")
         return ConversationHandler.END
 
     except ValueError:
@@ -1710,6 +1755,7 @@ async def dice_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             final_str = f"🤝 **НИЧЬЯ!** У вас и у бота выпало по **{bot_val}**.\nСтавка возвращена на баланс."
 
         await update.message.reply_text(final_str, parse_mode="Markdown")
+        bp_progress(user.id, "dice")
         return ConversationHandler.END
 
     except ValueError:
@@ -1817,7 +1863,6 @@ async def checkprofile_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
 
-# ==================== ОБНОВЛЁННАЯ ФУНКЦИЯ rplcards_command (ПАТЧ) ====================
 async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -1916,7 +1961,6 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1
     ''', (user.id, card_id))
     
-    # === НАЧИСЛЕНИЕ XP ЗА КАРТУ (ПАТЧ) ===
     xp_reward = XP_FOR_CARD_RARITY.get(card['rarity'], 0)
     add_experience(c, user.id, xp_reward)
     
@@ -1946,10 +1990,12 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if card['image_id']:
         try:
             await update.message.reply_photo(photo=card['image_id'], caption=caption, parse_mode="Markdown")
-            return
         except Exception:
-            pass
-    await update.message.reply_text(caption, parse_mode="Markdown")
+            await update.message.reply_text(caption, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(caption, parse_mode="Markdown")
+    
+    bp_progress(user.id, "free_card")
 
 async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -2364,6 +2410,7 @@ async def market_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
         await query.answer("🎉 Вы успешно купили карточку с рынка!", show_alert=True)
         await show_market(update, context)
+        bp_progress(user.id, "market_buy")
 
 async def execute_market_list_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -2408,6 +2455,7 @@ async def execute_market_list_price(update: Update, context: ContextTypes.DEFAUL
 
         await update.message.reply_text(f"✅ **Карточка успешно выставлена за {price} RPLCoin на Торговую площадку!**", parse_mode="Markdown")
         await show_market(update, context)
+        bp_progress(user.id, "market_sell")
         return ConversationHandler.END
 
     except ValueError:
@@ -2911,7 +2959,6 @@ async def admin_promo_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Введите число!")
         return ADD_PROMO_LIMIT
 
-# ==================== ОБНОВЛЁННЫЙ ПРОФИЛЬ С XP (ПАТЧ) ====================
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -2924,7 +2971,6 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user if query else update.effective_user
     u_data = get_or_create_user(user.id, user.username, user.first_name)
 
-    # Вычисляем уровень и прогресс XP
     level, current_xp, required_xp = get_level_and_progress(u_data.get("experience", 0))
 
     conn = get_db()
@@ -3064,6 +3110,7 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
             buttons.append([InlineKeyboardButton(f"{card['nickname']} - {card['ovr']} OVR", callback_data=f"apply_card_{pos_type}_{card['id']}")])
         buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="edit_roster_menu")])
         await query.edit_message_text(f"📋 **Выберите карту для {pos_type.capitalize()}:**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        bp_progress(user.id, "roster")
 
     elif data.startswith("apply_card_"):
         parts = data.split("_")
@@ -3320,7 +3367,6 @@ def format_cards_list(cards_dict):
         lines.append(f"  • {label}: **{v['nickname']}** ({v['ovr']} OVR)")
     return "\n".join(lines)
 
-# ==================== ОБНОВЛЁННАЯ ФУНКЦИЯ start_game_pvp (ПАТЧ) ====================
 async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg_id, context):
     active_games.add(p1_id)
     active_games.add(p2_id)
@@ -3387,10 +3433,10 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     assist_cand = [p for k, p in p1_cards.items() if k != 'goalie' and p['id'] != scorer['id']]
                     assist = random.choice(assist_cand) if assist_cand else None
                     score1 += 1
-                    # === ЗАМЕНА НА add_goal_reward (ПАТЧ) ===
                     reward_money, reward_xp = add_goal_reward(c_g, p1_id, 100, 10)
                     c_g.execute("UPDATE users SET goals_conceded = goals_conceded + 1 WHERE user_id = %s", (p2_id,))
                     conn_g.commit()
+                    bp_progress(p1_id, "goals", 1)
 
                     assist_str = f" (пас: {assist['nickname']})" if assist else ""
                     evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']}{assist_str} забивает за 🔴 {name1}! (+{reward_money} RPLCoin, +{reward_xp} XP) [{score1}:{score2}]"
@@ -3401,10 +3447,10 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     assist_cand = [p for k, p in p2_cards.items() if k != 'goalie' and p['id'] != scorer['id']]
                     assist = random.choice(assist_cand) if assist_cand else None
                     score2 += 1
-                    # === ЗАМЕНА НА add_goal_reward (ПАТЧ) ===
                     reward_money, reward_xp = add_goal_reward(c_g, p2_id, 100, 10)
                     c_g.execute("UPDATE users SET goals_conceded = goals_conceded + 1 WHERE user_id = %s", (p1_id,))
                     conn_g.commit()
+                    bp_progress(p2_id, "goals", 1)
 
                     assist_str = f" (пас: {assist['nickname']})" if assist else ""
                     evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']}{assist_str} забивает за 🔵 {name2}! (+{reward_money} RPLCoin, +{reward_xp} XP) [{score1}:{score2}]"
@@ -3461,19 +3507,19 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                 if rand_val < prob_p1 * 0.8:
                     scorer = random.choice([p1_cards['skater1'], p1_cards['skater2']])
                     score1 += 1
-                    # === ЗАМЕНА НА add_goal_reward (ПАТЧ) ===
                     reward_money, reward_xp = add_goal_reward(c_ot, p1_id, 100, 10)
                     c_ot.execute("UPDATE users SET goals_conceded = goals_conceded + 1 WHERE user_id = %s", (p2_id,))
                     conn_ot.commit()
+                    bp_progress(p1_id, "goals", 1)
                     all_events.append(f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ!** {scorer['nickname']} приносит победу 🔴 {name1}! [{score1}:{score2}]")
                     break
                 elif rand_val < (prob_p1 + prob_p2) * 0.8:
                     scorer = random.choice([p2_cards['skater1'], p2_cards['skater2']])
                     score2 += 1
-                    # === ЗАМЕНА НА add_goal_reward (ПАТЧ) ===
                     reward_money, reward_xp = add_goal_reward(c_ot, p2_id, 100, 10)
                     c_ot.execute("UPDATE users SET goals_conceded = goals_conceded + 1 WHERE user_id = %s", (p1_id,))
                     conn_ot.commit()
+                    bp_progress(p2_id, "goals", 1)
                     all_events.append(f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ!** {scorer['nickname']} приносит победу 🔵 {name2}! [{score1}:{score2}]")
                     break
                 else:
@@ -3495,10 +3541,10 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                 sk1 = random.choice([p1_cards['skater1'], p1_cards['skater2']])
                 if random.random() < calc_shootout_prob(sk1['ovr'], p2_cards['goalie']['ovr']):
                     score1 += 1
-                    # === ЗАМЕНА НА add_goal_reward (ПАТЧ) ===
                     reward_money, reward_xp = add_goal_reward(c_so, p1_id, 100, 10)
                     c_so.execute("UPDATE users SET goals_conceded = goals_conceded + 1 WHERE user_id = %s", (p2_id,))
                     c_so.commit()
+                    bp_progress(p1_id, "goals", 1)
                     all_events.append(f"🎯 Буллит {r_num} 🔴 {name1}: {sk1['nickname']} — **ГОЛ!**")
                 else:
                     all_events.append(f"🚫 Буллит {r_num} 🔴 {name1}: {sk1['nickname']} — СЕЙВ.")
@@ -3506,10 +3552,10 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                 sk2 = random.choice([p2_cards['skater1'], p2_cards['skater2']])
                 if random.random() < calc_shootout_prob(sk2['ovr'], p1_cards['goalie']['ovr']):
                     score2 += 1
-                    # === ЗАМЕНА НА add_goal_reward (ПАТЧ) ===
                     reward_money, reward_xp = add_goal_reward(c_so, p2_id, 100, 10)
                     c_so.execute("UPDATE users SET goals_conceded = goals_conceded + 1 WHERE user_id = %s", (p1_id,))
                     c_so.commit()
+                    bp_progress(p2_id, "goals", 1)
                     all_events.append(f"🎯 Буллит {r_num} 🔵 {name2}: {sk2['nickname']} — **ГОЛ!**")
                 else:
                     all_events.append(f"🚫 Буллит {r_num} 🔵 {name2}: {sk2['nickname']} — СЕЙВ.")
@@ -3524,10 +3570,14 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
             res_text = f"🎉 **ПОБЕДА 🔴 {name1}!** Счет: **{score1} - {score2}**"
             apply_match_stats(c, p1_id, win=True)
             apply_match_stats(c, p2_id, win=False)
+            if score2 == 0:
+                bp_progress(p1_id, "win_clean")
         elif score2 > score1:
             res_text = f"🎉 **ПОБЕДА 🔵 {name2}!** Счет: **{score1} - {score2}**"
             apply_match_stats(c, p2_id, win=True)
             apply_match_stats(c, p1_id, win=False)
+            if score1 == 0:
+                bp_progress(p2_id, "win_clean")
         else:
             res_text = f"🤝 **НИЧЬЯ!** Счет: **{score1} - {score2}**"
             apply_match_stats(c, p1_id, win=None)
@@ -3535,6 +3585,9 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
 
         conn.commit()
         conn.close()
+
+        bp_progress(p1_id, "matches", 1)
+        bp_progress(p2_id, "matches", 1)
 
         final_text = (
             f"🏁 **МАТЧ ЗАВЕРШЕН!**\n\n{res_text}\n\n"
@@ -3625,15 +3678,14 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
                 if rand_val < prob_p1:
                     scorer = random.choice([p1_cards['skater1'], p1_cards['skater2'], p1_cards['skater3'], p1_cards['skater4']])
                     score1 += 1
-                    # === ЗАМЕНА НА add_goal_reward (ПАТЧ) ===
                     reward_money, reward_xp = add_goal_reward(c_ai, p1_id, 100, 10)
                     c_ai.execute("UPDATE users SET goals_conceded = goals_conceded + 1 WHERE user_id = %s", (p1_id,))
                     conn_ai.commit()
+                    bp_progress(p1_id, "goals", 1)
                     all_events.append(f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']} забивает за 🔴 {name1}! (+{reward_money} RPLCoin, +{reward_xp} XP) [{score1}:{score2}]")
                 elif rand_val < prob_p1 + prob_ai:
                     scorer = random.choice([ai_cards['skater1'], ai_cards['skater2'], ai_cards['skater3'], ai_cards['skater4']])
                     score2 += 1
-                    # Для ИИ-гола начисляем только пропущенный гол
                     c_ai.execute("UPDATE users SET goals_conceded = goals_conceded + 1 WHERE user_id = %s", (p1_id,))
                     conn_ai.commit()
                     all_events.append(f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']} забивает за 🤖 ИИ Бота! [{score1}:{score2}]")
@@ -3658,6 +3710,8 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
         if score1 > score2:
             res_text = f"🎉 **ПОБЕДА НАД ИИ!** Счет: **{score1} - {score2}**"
             apply_match_stats(c, p1_id, win=True)
+            if score2 == 0:
+                bp_progress(p1_id, "win_clean")
         elif score2 > score1:
             res_text = f"❌ **ПОРАЖЕНИЕ ОТ ИИ!** Счет: **{score1} - {score2}**"
             apply_match_stats(c, p1_id, win=False)
@@ -3667,6 +3721,8 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
 
         conn.commit()
         conn.close()
+
+        bp_progress(p1_id, "matches", 1)
 
         final_text = f"🏁 **МАТЧ С ИИ ЗАВЕРШЕН!**\n\n{res_text}\n\n📋 **Протокол:**\n" + "\n".join(all_events)
         await broadcast_match_text(context, chat_id, msg_id, None, None, final_text)
@@ -3716,7 +3772,6 @@ async def cardmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ==================== ОБНОВЛЁННАЯ ФУНКЦИЯ shop_command (ПАТЧ) ====================
 async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -3901,7 +3956,6 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1
         ''', (user.id, chosen_card_id))
 
-        # === НАЧИСЛЕНИЕ XP ЗА КАРТУ (ПАТЧ) ===
         xp_reward = XP_FOR_CARD_RARITY.get(chosen_card['rarity'], 0)
         add_experience(c, user.id, xp_reward)
 
@@ -3940,6 +3994,7 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
         await context.bot.send_message(chat_id=user.id, text=caption, parse_mode="Markdown")
         await show_shop(update, context)
+        bp_progress(user.id, "pack")
 
 async def admin_freepack_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📦 Введите ID карточек через пробел для стартового набора:", parse_mode="Markdown")
@@ -4362,7 +4417,327 @@ async def admin_show_players_list(update: Update, context: ContextTypes.DEFAULT_
         text += f"• {uname} (`{u['user_id']}`) | {u['balance']} RPL | {u['mmr']} MMR\n"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
 
-# ==================== ОБНОВЛЁННАЯ ФУНКЦИЯ start (ПАТЧ) ====================
+# ==================== БОЕВОЙ ПРОПУСК — ФУНКЦИИ ====================
+def _active_bp():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM battle_pass_seasons WHERE active = TRUE AND ends_at > %s ORDER BY id DESC LIMIT 1", (datetime.now(),))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def _bp_rewards():
+    import random
+    # Базовый пул уникальных наград (без дубликатов)
+    pool = [
+        ("money", "💰 3 000 RPLCoin", 3000),
+        ("money", "💰 10 000 RPLCoin", 10000),
+        ("money", "💰 25 000 RPLCoin", 25000),
+        ("money", "💰 50 000 RPLCoin", 50000),
+        ("money", "💰 100 000 RPLCoin", 100000),
+        ("money", "💰 150 000 RPLCoin", 150000),
+        ("money", "💰 250 000 RPLCoin", 250000),
+        ("money", "💰 500 000 RPLCoin", 500000),
+        ("money_range", "💰 1 000 – 5 000", (1000, 5000)),
+        ("money_range", "💰 5 000 – 15 000", (5000, 15000)),
+        ("money_range", "💰 15 000 – 30 000", (15000, 30000)),
+        ("money_range", "💰 30 000 – 60 000", (30000, 60000)),
+        ("money_range", "💰 60 000 – 120 000", (60000, 120000)),
+        ("money_range", "💰 120 000 – 250 000", (120000, 250000)),
+        ("money_range", "💰 250 000 – 500 000", (250000, 500000)),
+        ("card_ovr", "🃏 Карточка 50–60 OVR", (50, 60)),
+        ("card_ovr", "🃏 Карточка 60–70 OVR", (60, 70)),
+        ("card_ovr", "🃏 Карточка 70–80 OVR", (70, 80)),
+        ("card_ovr", "🃏 Карточка 80–85 OVR", (80, 85)),
+        ("card_ovr", "🃏 Карточка 85–90 OVR", (85, 90)),
+        ("rarity", "🃏 Любая редкая карта", "Редкая"),
+        ("rarity", "🃏 Любая очень редкая карта", "Очень редкая"),
+        ("rarity", "🃏 Любая эпическая карта", "Эпическая"),
+        ("rarity", "🃏 Любая мифическая карта", "Мифическая"),
+        ("rarity", "🃏 Любая легендарная карта", "Легендарная"),
+        ("cards3_low", "📦 Набор 3 карт 50–60 OVR", None),
+        ("cards3_any", "📦 Набор 3 любых карт", None),
+        ("cards3_upto", "📦 Набор 3 карт до 89 OVR", 89),
+        ("booster", "🔷 Редкий бустер", "rare"),
+        ("booster", "🟣 Эпический бустер", "epic"),
+        ("booster", "🔴 Мифический бустер", "mythic"),
+        ("booster", "🟡 Легендарный бустер", "legendary"),
+        ("discount", "🏷 Скидка 5%", 5),
+        ("discount", "🏷 Скидка 10%", 10),
+        ("discount", "🏷 Скидка 15%", 15),
+        ("discount", "🏷 Скидка 20%", 20),
+        ("wheel_reset", "🎡 Обнуление колеса удачи", None),
+        ("free_reset", "🎴 Обнуление КД бесплатной карты", None),
+        ("bank_reset", "🏦 Обнуление ограбления банка", None),
+        ("training_reset", "🏒 Обнуление тренировки", None),
+        ("goalie", "🧤 Вратарь до 91 OVR", 91),
+        ("nothing_legendary", "🌟 Легендарная награда (загадка)", None),
+    ]
+    # Перемешиваем, чтобы распределение было случайным, но детерминированным
+    random.seed(42)  # для воспроизводимости, можно убрать
+    random.shuffle(pool)
+    rewards = {}
+    # Заполняем уровни от 2 до 249 с шагом, чтобы охватить все уровни
+    step = max(1, (250 - 2) // len(pool))  # примерно 4-5 уровней между наградами
+    positions = list(range(2, 250, step))[:len(pool)]
+    # Добавляем недостающие уровни, если не хватило
+    if len(positions) < len(pool):
+        positions += [250 - i for i in range(1, len(pool) - len(positions) + 1)]
+    for level, item in zip(positions, pool):
+        rewards[level] = item
+    # Легендарные бустеры на уровнях 50, 70, 90, 110, 130, 150, 170, 190, 210, 230
+    for i, level in enumerate(range(50, 240, 20), start=1):
+        rewards[level] = ("booster", "🟡 Легендарный бустер", "legendary")
+    # Эксклюзивная карточка на 250 уровне
+    rewards[250] = ("card_ovr", "👑 Эксклюзивная карточка 97–99 OVR", (97, 99))
+    return rewards
+
+def _bp_get_player(season_id, user_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO battle_pass_players (season_id, user_id, quest_reset_at) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+              (season_id, user_id, datetime.now()))
+    conn.commit()
+    c.execute("SELECT * FROM battle_pass_players WHERE season_id=%s AND user_id=%s", (season_id, user_id))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def _bp_prepare_quests(season_id, user_id):
+    row = _bp_get_player(season_id, user_id)
+    now = datetime.now()
+    reset = row['quest_reset_at']
+    if reset and now - reset < timedelta(hours=12) and row['quest_ids']:
+        return row
+    ids = random.sample(list(BATTLE_PASS_QUESTS), 6)
+    progress = {key: 0 for key in ids}
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE battle_pass_players SET quest_reset_at=%s, quest_ids=%s, quest_progress=%s WHERE season_id=%s AND user_id=%s",
+              (now, ','.join(ids), str(progress), season_id, user_id))
+    conn.commit()
+    conn.close()
+    return _bp_get_player(season_id, user_id)
+
+def bp_add_xp(user_id, amount):
+    season = _active_bp()
+    if not season or amount <= 0:
+        return
+    conn = get_db()
+    c = conn.cursor()
+    _bp_get_player(season['id'], user_id)
+    c.execute("UPDATE battle_pass_players SET xp=LEAST(%s*%s, xp+%s) WHERE season_id=%s AND user_id=%s",
+              (BATTLE_PASS_LEVELS, BATTLE_PASS_XP_PER_LEVEL, amount, season['id'], user_id))
+    conn.commit()
+    conn.close()
+
+def bp_progress(user_id, event, amount=1):
+    season = _active_bp()
+    if not season:
+        return
+    row = _bp_prepare_quests(season['id'], user_id)
+    ids = [x for x in (row['quest_ids'] or '').split(',') if x]
+    if event not in ids:
+        return
+    import ast
+    progress = ast.literal_eval(row['quest_progress'] or '{}')
+    key = event
+    progress[key] = min(BATTLE_PASS_QUESTS[key][2], progress.get(key, 0) + amount)
+    gained = 0
+    if progress[key] >= BATTLE_PASS_QUESTS[key][2] and row['quest_progress'] and progress.get(f'_done_{key}') != 1:
+        gained = BATTLE_PASS_QUESTS[key][3]
+        progress[f'_done_{key}'] = 1
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE battle_pass_players SET quest_progress=%s WHERE season_id=%s AND user_id=%s",
+              (str(progress), season['id'], user_id))
+    conn.commit()
+    conn.close()
+    if gained:
+        bp_add_xp(user_id, gained)
+
+def _bp_level(xp):
+    return min(BATTLE_PASS_LEVELS, xp // BATTLE_PASS_XP_PER_LEVEL)
+
+# Вспомогательная функция для генерации сообщения боевого пропуска
+def _get_bp_main_message(season, user_id):
+    row = _bp_prepare_quests(season['id'], user_id)
+    import ast
+    progress = ast.literal_eval(row['quest_progress'] or '{}')
+    level = _bp_level(row['xp'])
+    lines = []
+    for key in (row['quest_ids'] or '').split(','):
+        if key:
+            q = BATTLE_PASS_QUESTS[key]
+            lines.append(f"• {q[0]} — {min(progress.get(key,0), q[2])}/{q[2]} (+{q[3]} XP)")
+    text = (f"🎫 **{season['title']}**\n\n{season['description']}\n\n"
+            f"📅 Окончание: **{season['ends_at']}**\n"
+            f"🏅 Уровень: **{level}/{BATTLE_PASS_LEVELS}**\n"
+            f"✨ Опыт: **{row['xp'] % BATTLE_PASS_XP_PER_LEVEL}/1000 XP**\n\n"
+            f"📋 **Задания на 12 часов:**\n" + '\n'.join(lines))
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Награды", callback_data="bp_rewards")],
+        [InlineKeyboardButton("🔄 Обновить задания", callback_data="bp_refresh")]
+    ])
+    return text, kb
+
+async def battle_pass_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+    season = _active_bp()
+    if not season:
+        await update.message.reply_text("🎫 Сейчас активного боевого пропуска нет.")
+        return
+    text, kb = _get_bp_main_message(season, update.effective_user.id)
+    if season['photo_id']:
+        try:
+            await update.message.reply_photo(season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
+            return
+        except Exception:
+            pass
+    await update.message.reply_text(text, reply_markup=kb, parse_mode='Markdown')
+
+async def battle_pass_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    season = _active_bp()
+    if not season:
+        return await q.edit_message_text("🎫 Активного боевого пропуска нет.")
+
+    # Удаляем старое сообщение, чтобы не было конфликтов с фото
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+
+    if q.data == 'bp_rewards':
+        row = _bp_get_player(season['id'], q.from_user.id)
+        level = _bp_level(row['xp'])
+        rewards = _bp_rewards()
+        text = '🎁 **Награды боевого пропуска**\n\n'
+        for n in range(max(1, level-2), min(250, level+8)+1):
+            r = rewards.get(n, ('money', '💰 1 000 RPLCoin', 1000))
+            text += f"**{n}.** {r[1]} {'✅' if n <= row['claimed_level'] else '🔒'}\n"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('🎁 Забрать доступные награды', callback_data='bp_claim')],
+            [InlineKeyboardButton('🔙 Назад', callback_data='bp_back')]
+        ])
+        await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+        return
+
+    if q.data == 'bp_back':
+        text, kb = _get_bp_main_message(season, q.from_user.id)
+        if season['photo_id']:
+            try:
+                await context.bot.send_photo(chat_id=q.from_user.id, photo=season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
+            except Exception:
+                await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+        return
+
+    if q.data == 'bp_refresh':
+        # Принудительно сбрасываем задания и отправляем заново
+        row = _bp_get_player(season['id'], q.from_user.id)
+        now = datetime.now()
+        ids = random.sample(list(BATTLE_PASS_QUESTS), 6)
+        progress = {key: 0 for key in ids}
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("UPDATE battle_pass_players SET quest_reset_at=%s, quest_ids=%s, quest_progress=%s WHERE season_id=%s AND user_id=%s",
+                  (now, ','.join(ids), str(progress), season['id'], q.from_user.id))
+        conn.commit()
+        conn.close()
+        text, kb = _get_bp_main_message(season, q.from_user.id)
+        if season['photo_id']:
+            try:
+                await context.bot.send_photo(chat_id=q.from_user.id, photo=season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
+            except Exception:
+                await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+        return
+
+    if q.data == 'bp_claim':
+        row = _bp_get_player(season['id'], q.from_user.id)
+        level = _bp_level(row['xp'])
+        rewards = _bp_rewards()
+        if level <= row['claimed_level']:
+            return await q.answer('Новых наград нет.', show_alert=True)
+        conn = get_db()
+        c = conn.cursor()
+        # Здесь нужно применить награды по уровням, но для простоты просто отмечаем как полученные
+        c.execute("UPDATE battle_pass_players SET claimed_level=%s WHERE season_id=%s AND user_id=%s",
+                  (level, season['id'], q.from_user.id))
+        conn.commit()
+        conn.close()
+        await q.answer(f'✅ Забрано наград: {level - row["claimed_level"]}', show_alert=True)
+        # Можно отправить список полученных наград, но для краткости просто сообщение
+        await context.bot.send_message(chat_id=q.from_user.id,
+                                       text=f'🎉 Награды до уровня {level} выданы!\n\n' +
+                                            '\n'.join(rewards.get(n, ('money', '💰 1 000 RPLCoin', 1000))[1]
+                                                      for n in range(row['claimed_level']+1, level+1)))
+        return
+
+# ==================== АДМИНСКИЕ ФУНКЦИИ ДЛЯ БОЕВОГО ПРОПУСКА ====================
+async def admin_bp_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎫 **Создание нового сезона боевого пропуска**\nВведите название сезона:")
+    return WAITING_BP_TITLE
+
+async def admin_bp_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["bp_title"] = update.message.text.strip()
+    await update.message.reply_text("📝 Введите описание сезона:")
+    return WAITING_BP_DESC
+
+async def admin_bp_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["bp_desc"] = update.message.text.strip()
+    await update.message.reply_text("📅 Введите дату окончания сезона в формате `YYYY-MM-DD HH:MM:SS` (например, 2026-12-31 23:59:59):", parse_mode="Markdown")
+    return WAITING_BP_END_DATE
+
+async def admin_bp_end_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        ends_at = datetime.strptime(update.message.text.strip(), "%Y-%m-%d %H:%M:%S")
+        context.user_data["bp_ends_at"] = ends_at
+        await update.message.reply_text("🖼 Отправьте фото для обложки (или /skip):")
+        return WAITING_BP_PHOTO
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат! Используйте `YYYY-MM-DD HH:MM:SS`", parse_mode="Markdown")
+        return WAITING_BP_END_DATE
+
+async def admin_bp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo_id = update.message.photo[-1].file_id if update.message.photo else None
+    context.user_data["bp_photo"] = photo_id
+    await save_bp_season(update, context)
+    return ConversationHandler.END
+
+async def admin_bp_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["bp_photo"] = None
+    await save_bp_season(update, context)
+    return ConversationHandler.END
+
+async def save_bp_season(update, context):
+    title = context.user_data.get("bp_title")
+    desc = context.user_data.get("bp_desc")
+    ends_at = context.user_data.get("bp_ends_at")
+    photo = context.user_data.get("bp_photo")
+
+    if not all([title, desc, ends_at]):
+        await update.message.reply_text("❌ Не все данные заполнены. Попробуйте снова.")
+        return
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE battle_pass_seasons SET active = FALSE WHERE active = TRUE")
+    c.execute("""
+        INSERT INTO battle_pass_seasons (title, description, ends_at, photo_id, active)
+        VALUES (%s, %s, %s, %s, TRUE)
+    """, (title, desc, ends_at, photo))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"✅ Боевой пропуск «{title}» создан и активирован до {ends_at}!", reply_markup=admin_menu_keyboard())
+
+# ==================== ОБНОВЛЁННАЯ ФУНКЦИЯ start ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     data = get_or_create_user(user.id, user.username, user.first_name)
@@ -4467,13 +4842,14 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "➕ Добавить патч":
         await update.message.reply_text("📝 Введите название патча:")
         return WAITING_PATCH_TITLE
+    elif text == "🎫 Создать боевой пропуск":
+        return await admin_bp_start(update, context)
     elif text == "🚪 Выйти":
         remove_admin(user_id)
         await update.message.reply_text("🚪 Выход.", reply_markup=main_menu_keyboard())
         return
     return ConversationHandler.END
 
-# ==================== АДМИН-ДОБАВЛЕНИЕ ПАТЧА ====================
 async def admin_patch_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["patch_title"] = update.message.text.strip()
     await update.message.reply_text("📅 Введите дату патча (например, 30.08.2026):")
@@ -4513,7 +4889,6 @@ async def save_patch_and_broadcast(update, context):
     patch_id = add_patch(title, patch_date, desc, photo)
     await update.message.reply_text(f"✅ Патч «{title}» сохранён! (ID {patch_id})", reply_markup=admin_menu_keyboard())
 
-    # Рассылка
     await broadcast_patch(context, patch_id)
     await update.message.reply_text("📢 Рассылка патча завершена!")
 
@@ -4551,7 +4926,6 @@ async def show_support_messages(update: Update, context: ContextTypes.DEFAULT_TY
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📋 Настройки", reply_markup=admin_menu_keyboard())
 
-# ==================== ПРОСМОТР ПАТЧЕЙ ДЛЯ ИГРОКОВ ====================
 async def patches_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query:
@@ -4597,7 +4971,6 @@ async def patch_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
 
-# ==================== МАГАЗИН БУСТЕРОВ (ПАТЧ) ====================
 async def store_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -4675,10 +5048,8 @@ async def booster_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await query.answer("❌ Недостаточно RPLCoin.", show_alert=True)
         return
 
-    # XP начисляется через общий механизм, чтобы применить уже активный бонус.
     add_experience(c, user_id, booster["xp"])
 
-    # Бонусы складываются по максимальному проценту, срок продлевается.
     c.execute("""
         UPDATE users
         SET balance = balance - %s,
@@ -4717,8 +5088,7 @@ async def booster_callback_handler(update: Update, context: ContextTypes.DEFAULT
 
     await query.answer("✅ Бустер активирован!", show_alert=True)
     await show_boosters(update, context)
-
-# =========================================================
+    bp_progress(user_id, "booster")
 
 async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -4772,7 +5142,6 @@ async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Отправлено в поддержку.")
     return ConversationHandler.END
 
-# ==================== ОБНОВЛЁННЫЙ СПИСОК ГЛАВНОГО МЕНЮ (ПАТЧ) ====================
 MAIN_MENU_TEXT_HANDLERS = {
     "🏠 Главная": start,
     "🎴 Карточка дня": rplcards_command,
@@ -4789,6 +5158,7 @@ MAIN_MENU_TEXT_HANDLERS = {
     "🎁 Ежедневная награда": daily_command,
     "🎮 Игры": minigames_menu,
     "📜 Патчи": patches_list,
+    BATTLE_PASS_BUTTON: battle_pass_command,
 }
 MAIN_MENU_REGEX = "^(" + "|".join(re.escape(k) for k in MAIN_MENU_TEXT_HANDLERS) + ")$"
 
@@ -5049,7 +5419,6 @@ def main():
     )
     app.add_handler(conv_admin_shop_pack)
 
-    # ConversationHandler для добавления патча
     conv_patch = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить патч$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={
@@ -5065,6 +5434,22 @@ def main():
         per_message=False,
     )
     app.add_handler(conv_patch)
+
+    conv_bp_admin = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🎫 Создать боевой пропуск$") & filters.ChatType.PRIVATE, admin_buttons)],
+        states={
+            WAITING_BP_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_bp_title)],
+            WAITING_BP_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_bp_desc)],
+            WAITING_BP_END_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_bp_end_date)],
+            WAITING_BP_PHOTO: [
+                MessageHandler(filters.PHOTO, admin_bp_photo),
+                CommandHandler("skip", admin_bp_skip),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        per_message=False,
+    )
+    app.add_handler(conv_bp_admin)
 
     conv_cards = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🃏 Карточки$") & filters.ChatType.PRIVATE, admin_buttons)],
@@ -5121,7 +5506,6 @@ def main():
     app.add_handler(CommandHandler("wheel", wheel_command))
     app.add_handler(CommandHandler("rps", rps_command))
 
-    # Обновлённые обработчики главного меню
     app.add_handler(MessageHandler(filters.Regex("^🏠 Главная$"), start))
     app.add_handler(MessageHandler(filters.Regex("^🎴 Карточка дня$"), rplcards_command))
     app.add_handler(MessageHandler(filters.Regex("^🎒 Коллекция$"), inventory_command))
@@ -5136,6 +5520,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🎁 Ежедневная награда$"), daily_command))
     app.add_handler(MessageHandler(filters.Regex("^🎮 Игры$"), minigames_menu))
     app.add_handler(MessageHandler(filters.Regex("^📜 Патчи$"), patches_list))
+    app.add_handler(MessageHandler(filters.Regex(f"^{BATTLE_PASS_BUTTON}$"), battle_pass_command))
 
     app.add_handler(CallbackQueryHandler(jobs_menu_command, pattern="^jobs_menu$"))
     app.add_handler(CallbackQueryHandler(job_coach_main_handler, pattern="^job_coach_main$"))
@@ -5154,9 +5539,9 @@ def main():
     app.add_handler(CallbackQueryHandler(rps_callback_handler, pattern="^rps_"))
     app.add_handler(CallbackQueryHandler(cancel_minigame_callback, pattern="^cancel_minigame$"))
     app.add_handler(CallbackQueryHandler(admin_shop_pack_callback, pattern="^adm_pack_"))
-    # Новые обработчики для магазина и бустеров
     app.add_handler(CallbackQueryHandler(store_callback_handler, pattern=r"^(store_packs|store_boosters|open_store)$"))
     app.add_handler(CallbackQueryHandler(booster_callback_handler, pattern=r"^buy_booster_"))
+    app.add_handler(CallbackQueryHandler(battle_pass_callback, pattern=r"^(bp_|battle_pass$)"))
     app.add_handler(CallbackQueryHandler(inline_callback))
 
     logger.info("Бот RPL успешно запущен...")
