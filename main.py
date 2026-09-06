@@ -4426,9 +4426,17 @@ def _active_bp():
     conn.close()
     return row
 
+# Глобальная переменная для кэша наград (определите в начале файла, например, после импортов)
+_BP_REWARDS_CACHE = None
+
 def _bp_rewards():
+    global _BP_REWARDS_CACHE
+    if _BP_REWARDS_CACHE is not None:
+        return _BP_REWARDS_CACHE
+    
     import random
-    # Базовый пул уникальных наград (тип, описание, значение)
+    rng = random.Random(42)  # фиксированный seed для детерминизма
+
     pool = [
         ("money", "💰 1 000 RPLCoin", 1000),
         ("money", "💰 2 500 RPLCoin", 2500),
@@ -4473,29 +4481,34 @@ def _bp_rewards():
         ("goalie", "🧤 Вратарь до 91 OVR", 91),
         ("nothing_legendary", "🌟 Загадочная награда", None),
     ]
+
     total_levels = 250
     expanded = []
-    # Повторяем пул несколько раз, каждый раз перемешивая
-    for _ in range(total_levels // len(pool) + 2):
+    while len(expanded) < total_levels:
         shuffled = pool.copy()
-        random.shuffle(shuffled)
+        rng.shuffle(shuffled)
         expanded.extend(shuffled)
     expanded = expanded[:total_levels]
-    # Убираем повторяющиеся соседние награды (меняем местами)
+
+    # Убираем повторяющиеся соседние награды
     for i in range(1, len(expanded)):
         if expanded[i][0] == expanded[i-1][0] and expanded[i][1] == expanded[i-1][1]:
             for j in range(i+1, min(i+10, len(expanded))):
                 if expanded[j][0] != expanded[i-1][0] or expanded[j][1] != expanded[i-1][1]:
                     expanded[i], expanded[j] = expanded[j], expanded[i]
                     break
+
     rewards = {}
     for level in range(1, total_levels+1):
         rewards[level] = expanded[level-1]
-    # Легендарные бустеры на уровнях 50,70,90,110,130,150,170,190,210,230
+
+    # Легендарные бустеры на фиксированных уровнях
     for level in [50, 70, 90, 110, 130, 150, 170, 190, 210, 230]:
         rewards[level] = ("booster", "🟡 Легендарный бустер", "legendary")
     # Эксклюзивная карточка на 250 уровне
     rewards[250] = ("card_ovr", "👑 Эксклюзивная карточка 97–99 OVR", (97, 99))
+
+    _BP_REWARDS_CACHE = rewards
     return rewards
 
 def _bp_get_player(season_id, user_id):
