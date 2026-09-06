@@ -427,13 +427,13 @@ def init_db():
             PRIMARY KEY(season_id, user_id)
         )
     ''')
+
+    c.execute('ALTER TABLE battle_pass_players ADD COLUMN IF NOT EXISTS last_manual_refresh TIMESTAMP')
     
     conn.commit()
     conn.close()
 
 init_db()
-
-c.execute('ALTER TABLE battle_pass_players ADD COLUMN IF NOT EXISTS last_manual_refresh TIMESTAMP')
 
 def get_or_create_user(user_id, username="", first_name=""):
     conn = get_db()
@@ -4672,25 +4672,25 @@ async def battle_pass_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
         return
 
-    if q.data == 'bp_refresh':
-        success, msg = _manual_refresh_quests(season['id'], q.from_user.id)
-        if not success:
-            await q.answer(msg, show_alert=True)
-            return
+if q.data == 'bp_refresh':
+    success, msg = _manual_refresh_quests(season['id'], q.from_user.id)
+    if not success:
         await q.answer(msg, show_alert=True)
-        text, kb = _get_bp_main_message(season, q.from_user.id)
-        try:
-            await q.message.delete()
-        except:
-            pass
-        if season['photo_id']:
-            try:
-                await context.bot.send_photo(chat_id=q.from_user.id, photo=season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
-            except Exception:
-                await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
-        else:
-            await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
         return
+    await q.answer(msg, show_alert=True)
+    text, kb = _get_bp_main_message(season, q.from_user.id)
+    try:
+        await q.message.delete()
+    except:
+        pass
+    if season['photo_id']:
+        try:
+            await context.bot.send_photo(chat_id=q.from_user.id, photo=season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
+        except Exception:
+            await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+    else:
+        await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+    return
 
     if q.data == 'bp_claim':
         row = _bp_get_player(season['id'], q.from_user.id)
