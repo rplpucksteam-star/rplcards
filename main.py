@@ -433,6 +433,8 @@ def init_db():
 
 init_db()
 
+c.execute('ALTER TABLE battle_pass_players ADD COLUMN IF NOT EXISTS last_manual_refresh TIMESTAMP')
+
 def get_or_create_user(user_id, username="", first_name=""):
     conn = get_db()
     c = conn.cursor()
@@ -4522,21 +4524,18 @@ def _bp_get_player(season_id, user_id):
     conn.close()
     return row
 
-def _bp_prepare_quests(season_id, user_id):
-    row = _bp_get_player(season_id, user_id)
-    now = datetime.now()
-    reset = row['quest_reset_at']
-    if reset and now - reset < timedelta(hours=12) and row['quest_ids']:
-        return row
-    ids = random.sample(list(BATTLE_PASS_QUESTS), 6)
-    progress = {key: 0 for key in ids}
+def _bp_get_player(season_id, user_id):
     conn = get_db()
     c = conn.cursor()
-    c.execute("UPDATE battle_pass_players SET quest_reset_at=%s, quest_ids=%s, quest_progress=%s WHERE season_id=%s AND user_id=%s",
-              (now, ','.join(ids), str(progress), season_id, user_id))
+    c.execute("""
+        INSERT INTO battle_pass_players (season_id, user_id, quest_reset_at, last_manual_refresh)
+        VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING
+    """, (season_id, user_id, datetime.now(), None))
     conn.commit()
+    c.execute("SELECT * FROM battle_pass_players WHERE season_id=%s AND user_id=%s", (season_id, user_id))
+    row = c.fetchone()
     conn.close()
-    return _bp_get_player(season_id, user_id)
+    return row
 
 def bp_add_xp(user_id, amount):
     season = _active_bp()
@@ -4574,6 +4573,35 @@ def bp_progress(user_id, event, amount=1):
     conn.close()
     if gained:
         bp_add_xp(user_id, gained)
+
+def _manual_refresh_quests(season_id, user_id):
+    now = datetime.now()
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT last_manual_refresh FROM battle_pass_players WHERE season_id=%s AND user_id=%s", (season_id, user_id))
+    row = c.fetchone()
+    if row and row['last_manual_refresh']:
+        last = row['last_manual_refresh']
+        if isinstance(last, str):
+            last = datetime.fromisoformat(last)
+        diff = now - last
+        if diff < timedelta(hours=24):
+            remaining = timedelta(hours=24) - diff
+            hours = remaining.seconds // 3600
+            minutes = (remaining.seconds % 3600) // 60
+            conn.close()
+            return False, f"⏳ Вы можете обновлять задания не чаще 1 раза в сутки. Осталось: {hours} ч {minutes} мин"
+    # Генерируем новые задания
+    ids = random.sample(list(BATTLE_PASS_QUESTS), 6)
+    progress = {key: 0 for key in ids}
+    c.execute("""
+        UPDATE battle_pass_players 
+        SET quest_reset_at=%s, quest_ids=%s, quest_progress=%s, last_manual_refresh=%s 
+        WHERE season_id=%s AND user_id=%s
+    """, (now, ','.join(ids), str(progress), now, season_id, user_id))
+    conn.commit()
+    conn.close()
+    return True, "✅ Задания обновлены!"
 
 def _bp_level(xp):
     return min(BATTLE_PASS_LEVELS, xp // BATTLE_PASS_XP_PER_LEVEL)
@@ -4656,26 +4684,25 @@ async def battle_pass_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if q.data == 'bp_refresh':
-        # Принудительно сбрасываем задания и отправляем заново
-        row = _bp_get_player(season['id'], q.from_user.id)
-        now = datetime.now()
-        ids = random.sample(list(BATTLE_PASS_QUESTS), 6)
-        progress = {key: 0 for key in ids}
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("UPDATE battle_pass_players SET quest_reset_at=%s, quest_ids=%s, quest_progress=%s WHERE season_id=%s AND user_id=%s",
-                  (now, ','.join(ids), str(progress), season['id'], q.from_user.id))
-        conn.commit()
-        conn.close()
-        text, kb = _get_bp_main_message(season, q.from_user.id)
-        if season['photo_id']:
-            try:
-                await context.bot.send_photo(chat_id=q.from_user.id, photo=season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
-            except Exception:
-                await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
-        else:
-            await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+    success, msg = _manual_refresh_quests(season['id'], q.from_user.id)
+    if not success:
+        await q.answer(msg, show_alert=True)
         return
+    await q.answer(msg, show_alert=True)
+    # После обновления показываем главное меню боевого пропуска
+    text, kb = _get_bp_main_message(season, q.from_user.id)
+    try:
+        await q.message.delete()
+    except:
+        pass
+    if season['photo_id']:
+        try:
+            await context.bot.send_photo(chat_id=q.from_user.id, photo=season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
+        except Exception:
+            await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+    else:
+        await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+    return
 
     if q.data == 'bp_claim':
         row = _bp_get_player(season['id'], q.from_user.id)
