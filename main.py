@@ -4526,6 +4526,22 @@ def _bp_get_player(season_id, user_id):
     conn.close()
     return row
 
+def _bp_prepare_quests(season_id, user_id):
+    row = _bp_get_player(season_id, user_id)
+    now = datetime.now()
+    reset = row['quest_reset_at']
+    if reset and now - reset < timedelta(hours=12) and row['quest_ids']:
+        return row
+    ids = random.sample(list(BATTLE_PASS_QUESTS), 6)
+    progress = {key: 0 for key in ids}
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE battle_pass_players SET quest_reset_at=%s, quest_ids=%s, quest_progress=%s WHERE season_id=%s AND user_id=%s",
+              (now, ','.join(ids), str(progress), season_id, user_id))
+    conn.commit()
+    conn.close()
+    return _bp_get_player(season_id, user_id)
+
 def bp_add_xp(user_id, amount):
     season = _active_bp()
     if not season or amount <= 0:
@@ -4672,25 +4688,25 @@ async def battle_pass_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
         return
 
-if q.data == 'bp_refresh':
-    success, msg = _manual_refresh_quests(season['id'], q.from_user.id)
-    if not success:
+    if q.data == 'bp_refresh':
+        success, msg = _manual_refresh_quests(season['id'], q.from_user.id)
+        if not success:
+            await q.answer(msg, show_alert=True)
+            return
         await q.answer(msg, show_alert=True)
-        return
-    await q.answer(msg, show_alert=True)
-    text, kb = _get_bp_main_message(season, q.from_user.id)
-    try:
-        await q.message.delete()
-    except:
-        pass
-    if season['photo_id']:
+        text, kb = _get_bp_main_message(season, q.from_user.id)
         try:
-            await context.bot.send_photo(chat_id=q.from_user.id, photo=season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
-        except Exception:
+            await q.message.delete()
+        except:
+            pass
+        if season['photo_id']:
+            try:
+                await context.bot.send_photo(chat_id=q.from_user.id, photo=season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
+            except Exception:
+                await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+        else:
             await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
-    else:
-        await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
-    return
+        return
 
     if q.data == 'bp_claim':
         row = _bp_get_player(season['id'], q.from_user.id)
