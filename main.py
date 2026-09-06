@@ -4516,17 +4516,6 @@ def _bp_rewards():
 def _bp_get_player(season_id, user_id):
     conn = get_db()
     c = conn.cursor()
-    c.execute("INSERT INTO battle_pass_players (season_id, user_id, quest_reset_at) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-              (season_id, user_id, datetime.now()))
-    conn.commit()
-    c.execute("SELECT * FROM battle_pass_players WHERE season_id=%s AND user_id=%s", (season_id, user_id))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-def _bp_get_player(season_id, user_id):
-    conn = get_db()
-    c = conn.cursor()
     c.execute("""
         INSERT INTO battle_pass_players (season_id, user_id, quest_reset_at, last_manual_refresh)
         VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING
@@ -4684,25 +4673,24 @@ async def battle_pass_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if q.data == 'bp_refresh':
-    success, msg = _manual_refresh_quests(season['id'], q.from_user.id)
-    if not success:
+        success, msg = _manual_refresh_quests(season['id'], q.from_user.id)
+        if not success:
+            await q.answer(msg, show_alert=True)
+            return
         await q.answer(msg, show_alert=True)
-        return
-    await q.answer(msg, show_alert=True)
-    # После обновления показываем главное меню боевого пропуска
-    text, kb = _get_bp_main_message(season, q.from_user.id)
-    try:
-        await q.message.delete()
-    except:
-        pass
-    if season['photo_id']:
+        text, kb = _get_bp_main_message(season, q.from_user.id)
         try:
-            await context.bot.send_photo(chat_id=q.from_user.id, photo=season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
-        except Exception:
+            await q.message.delete()
+        except:
+            pass
+        if season['photo_id']:
+            try:
+                await context.bot.send_photo(chat_id=q.from_user.id, photo=season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
+            except Exception:
+                await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
+        else:
             await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
-    else:
-        await context.bot.send_message(chat_id=q.from_user.id, text=text, reply_markup=kb, parse_mode='Markdown')
-    return
+        return
 
     if q.data == 'bp_claim':
         row = _bp_get_player(season['id'], q.from_user.id)
@@ -4712,13 +4700,11 @@ async def battle_pass_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return await q.answer('Новых наград нет.', show_alert=True)
         conn = get_db()
         c = conn.cursor()
-        # Здесь нужно применить награды по уровням, но для простоты просто отмечаем как полученные
         c.execute("UPDATE battle_pass_players SET claimed_level=%s WHERE season_id=%s AND user_id=%s",
                   (level, season['id'], q.from_user.id))
         conn.commit()
         conn.close()
         await q.answer(f'✅ Забрано наград: {level - row["claimed_level"]}', show_alert=True)
-        # Можно отправить список полученных наград, но для краткости просто сообщение
         await context.bot.send_message(chat_id=q.from_user.id,
                                        text=f'🎉 Награды до уровня {level} выданы!\n\n' +
                                             '\n'.join(rewards.get(n, ('money', '💰 1 000 RPLCoin', 1000))[1]
